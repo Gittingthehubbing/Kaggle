@@ -20,6 +20,7 @@ from sklearn.ensemble import RandomForestRegressor as rfr
 from sklearn.linear_model import BayesianRidge as bayR
 from sklearn.preprocessing import StandardScaler as ss
 from sklearn.model_selection import train_test_split as tts
+from sklearn.preprocessing import StandardScaler as ss
 import os
 
 class net(nn.Module):
@@ -51,4 +52,26 @@ targetCol = "target"
 idCol = "id"
 
 trD = trainDataRaw.drop([targetCol, idCol],axis=1)
-teD = testDataRaw.drop([targetCol, idCol],axis=1)
+teD = testDataRaw.drop([idCol],axis=1)
+trTarget = trainDataRaw[targetCol]
+
+xTr, xE, yTr, yE = tts(trD, trTarget)
+
+# Normalise
+ssTr = ss().fit(xTr)
+
+xTrT = ssTr.transform(xTr)
+xET = ssTr.transform(xE)
+teDT = ssTr.transform(teD)
+
+ssTarget = ss().fit(yTr.to_numpy().reshape(-1 ,1))
+yTrT = ssTarget.transform(yTr.to_numpy().reshape(-1 ,1))
+yET = ssTarget.transform(yE.to_numpy().reshape(-1 ,1))
+
+#make Dataloaders
+trDl = dl(TensorDataset(t.Tensor(xTrT), t.Tensor(yTrT)))
+evalDl = dl(TensorDataset(t.Tensor(xET), t.Tensor(yET)))
+
+# Shallow tests
+
+
