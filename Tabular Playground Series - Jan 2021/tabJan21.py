@@ -27,17 +27,22 @@ from sklearn.metrics import mean_squared_error as mse
 import os
 import datetime
 from tensorboardX import SummaryWriter
-
+from sklearn.decomposition import PCA
 import pytorch_lightning as pl
+
+#TODO implement optuna for shallows
+#TODO Rebalance data
+#TODO increase NN complexity
+#TODO plot data by doing PCA down to 3 dimensions
 
 
 
 class LitModel(pl.LightningModule):
 
-    def __init__(self):
+    def __init__(self,x):
         super().__init__()
         self.lr = lr
-        self.l1 = nn.Linear(14, 1)
+        self.l1 = nn.Linear(x.shape[1], 1)
 
     def forward(self, x):
         return t.relu(self.l1(x.view(x.size(0), -1)))
@@ -45,7 +50,8 @@ class LitModel(pl.LightningModule):
     def training_step(self, batch, batch_idx):
         x, y = batch
         y_hat = self(x)
-        loss = F.mse_loss(y_hat, y)
+        loss = t.sqrt(F.mse_loss(y_hat, y))
+        self.log('train_loss', loss, prog_bar=True)
         return loss
 
     def configure_optimizers(self):
@@ -70,7 +76,7 @@ class lnet(pl.LightningModule):
         x, y = batch
         # x = x.view(x.size(0),-1)
         z = self(x)
-        loss = F.mse_loss(y, z)
+        loss = t.sqrt(F.mse_loss(y, z))
         # self.log('train_loss', loss)
         return loss
 
@@ -139,7 +145,7 @@ def trainNN(trDl, evalDl,epochs=2):
         for i, (x,y) in enumerate(trDl):
             nnNet.train()
             out = nnNet(x.to(device))
-            lossTr = criterion(y.to(device), out)
+            lossTr = t.sqrt(criterion(y.to(device), out))
             if addL1Reg:
                     l2_reg = t.tensor(0.).to(device)
                     for nParam, parameter in enumerate(nnNet.parameters()):
@@ -159,7 +165,7 @@ def trainNN(trDl, evalDl,epochs=2):
                     for iTe,(xTe, yTe) in enumerate(evalDl):
                         nnNet.eval()
                         outTe = nnNet(xTe.to(device))
-                        lossTe = criterion(yTe.to(device),outTe)
+                        lossTe = t.sqrt(criterion(yTe.to(device),outTe))
                         if addL1Reg:
                             l2_reg = t.tensor(0.).to(device)
                             for parameter in nnNet.parameters():
@@ -187,8 +193,8 @@ def trainNN(trDl, evalDl,epochs=2):
 
 mainDir = r"E:\KaggleData\Tabular Playground Series - Jan 2021"
 
-epochs = 20
-lr = 1e-6
+epochs = 5
+lr = 6e-6
 batchSize = 32
 addL1Reg = True
 L1val = 0.004
@@ -197,9 +203,14 @@ doLearningCurve = True
 logTB = 0
 
 doShallows =False
-doPYNN = 1
-doLightning = 0
+doPYNN = 0
+doLightning = 1
 tuneModel = 0
+
+doPCA = False #looks to be unhelpful
+plotPCA = False
+
+checkHist = True
 
 os.chdir(mainDir)
 
@@ -217,6 +228,43 @@ idCol = "id"
 trD = trainDataRaw.drop([targetCol, idCol],axis=1)
 teD = testDataRaw.drop([idCol],axis=1)
 trTarget = trainDataRaw[targetCol]
+
+if doPCA:
+    pca = PCA(n_components=10).fit(trD)
+    trD = pca.transform(trD)
+    teD = pca.transform(teD)
+    print(trD.shape,teD.shape)
+    if plotPCA:
+        pcaPlot = PCA(n_components=3).fit(trainDataRaw.drop([targetCol, idCol],axis=1), y=trTarget)
+        xPCAplot = pcaPlot.transform(trainDataRaw.drop([targetCol, idCol],axis=1))
+        yPCAplot = trTarget.copy()
+        
+        try:
+            %matplotlib qt
+        except:
+            print('not in iPhython')
+        fig = plt.figure()
+        ax = fig.add_subplot(projection='3d')
+        numSamples = 1000
+        idxArr = np.arange(len(xPCAplot))
+        np.random.shuffle(idxArr)
+        idxSel = idxArr[:numSamples]
+        ax.scatter(xPCAplot[idxSel,0], xPCAplot[idxSel,1], xPCAplot[idxSel,2], c = yPCAplot[idxSel])
+        plt.show()
+        plt.close()
+        
+        try:
+            %matplotlib inline
+        except:
+            print('not in iPhython')
+
+if checkHist:
+    plt.hist(trTarget,bins=200)
+    plt.xlim('Target Variable')
+    plt.ylim('Frequency')
+    plt.savefig('./TargetData_Histogram.png',dpi=300)
+    plt.show()
+    plt.close()
 
 xTr, xE, yTr, yE = tts(trD, trTarget)
 
@@ -249,7 +297,7 @@ if doShallows:
 
     bay.fit(xTrT, yTrT)
     bay = mse(bay.predict(xTrT),yTrT)
-    print('Forest MSE: ',bay)
+    print('Forest MSE: ',np.sqrt(bay))
 
 
 # nn approach
@@ -338,8 +386,8 @@ if doLightning:
     trDl = dl(TensorDataset(t.Tensor(xTrT).float(), t.Tensor(yTrT).float()),
               batch_size=batchSize,shuffle=True)
 
-    trainer = pl.Trainer(gpus=1,max_epochs=epochs)
-    model1 = LitModel()
+    trainer = pl.Trainer(gpus=1,max_epochs=epochs,stochastic_weight_avg=True)
+    model1 = LitModel(t.Tensor(xTrT[:50]).float())
     if tuneModel:
         lr_finder = trainer.tuner.lr_find(model1,trDl)
         fig = lr_finder.plot(suggest=True)
