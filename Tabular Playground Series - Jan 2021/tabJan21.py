@@ -17,6 +17,7 @@ import pytorch_lightning as pl
 from tqdm import tqdm
 import pandas as pd
 import numpy as np
+import seaborn as sb
 from sklearn.svm import SVR
 from sklearn.ensemble import RandomForestRegressor as rfr
 from sklearn.linear_model import BayesianRidge as bayR
@@ -29,12 +30,11 @@ import datetime
 from tensorboardX import SummaryWriter
 from sklearn.decomposition import PCA
 import pytorch_lightning as pl
+import optuna as opt
 
 #TODO implement optuna for shallows
-#TODO Rebalance data
+#TODO Rebalance data (Might not be needed)
 #TODO increase NN complexity
-#TODO plot data by doing PCA down to 3 dimensions
-
 
 
 class LitModel(pl.LightningModule):
@@ -120,6 +120,8 @@ class net(nn.Module):
 
 
 class dset(Dataset):
+    
+    
     def __init__(self, xAll,yAll):
         super().__init__()
         self.xAll = xAll
@@ -134,18 +136,54 @@ class dset(Dataset):
         return (t.Tensor(x,dtype=t.float), t.Tensor(y,dtype=t.float))
 
 
-def trainNN(trDl, evalDl,epochs=2):
+def makeModel(trial):
+    # sets layers and number of neurons for each trial
+    #builds dict with parameters that can be used to make best model
+    nl = trial.suggest_int("nL",minLayers,maxLayers)
+    layers=[]
+    inFeat = xTrT.shape[1] #assumes 1D data for each sample
+    lastOut = yTrT.shape[1]
+    
+    for i in range(nl):
+        outFeat = trial.suggest_int(f"n{i}",minNeurons,maxNeurons)
+        layers.append(nn.Linear(inFeat, outFeat)) 
+        actiLayer = trial.suggest_categorical(f"a{i}",possibleActiFuncs) 
+        layers.append(getattr(nn, actiLayer)())
+        dropOutRatio = trial.suggest_float(f"dropoutL{i}",minDropOut,maxDropOut)
+        layers.append(nn.Dropout(dropOutRatio))        
+        inFeat = outFeat 
+    layers.append(nn.Linear(inFeat, lastOut))
+    
+    return nn.Sequential(*layers)
+        
+def shallowObjective(trial):
+    
+    model = trial.suggest_categorical("modelname",possibleShallows)
+
+def objective(trial):
+    
+    model = makeModel(trial).to(device)
+    lr = trial.suggest_float("lr", minLr, maxLr, log=True)
+    
+    opti = t.optim.Adam(model.parameters(),lr = lr)
+    evalLossMean = trainNN(model,opti,trDl, evalDl,epochs=epochs, trial=trial)
+    return evalLossMean
+
+def trainNN(nnNet,opti,trDl, evalDl,epochs=2, trial=None):
+    
     writerCount=0
     evalWriterCount=0
     trLosses =[]
     evalLosses = []
+    if trial is not None:
+        L1val = trial.suggest_float("L1val",l1min,l1max,log=True)
     for e in tqdm(range(epochs)):
         epochLossTr = []
         epochLossE = []
         for i, (x,y) in enumerate(trDl):
             nnNet.train()
             out = nnNet(x.to(device))
-            lossTr = t.sqrt(criterion(y.to(device), out))
+            lossTr = criterion(y.to(device), out)
             if addL1Reg:
                     l2_reg = t.tensor(0.).to(device)
                     for nParam, parameter in enumerate(nnNet.parameters()):
@@ -158,14 +196,16 @@ def trainNN(trDl, evalDl,epochs=2):
             if logTB:
                 writerCount+=1
                 writerTr.add_scalar("lossTr", lossTr.cpu().detach().numpy().item(),writerCount)
-
+            if trial is not None and i >= numBatchesForOptunaTr*batchSize:
+                break
+                
 
             if i%500==0:
                 with t.no_grad():
                     for iTe,(xTe, yTe) in enumerate(evalDl):
                         nnNet.eval()
                         outTe = nnNet(xTe.to(device))
-                        lossTe = t.sqrt(criterion(yTe.to(device),outTe))
+                        lossTe = criterion(yTe.to(device),outTe)
                         if addL1Reg:
                             l2_reg = t.tensor(0.).to(device)
                             for parameter in nnNet.parameters():
@@ -175,9 +215,16 @@ def trainNN(trDl, evalDl,epochs=2):
                         if logTB:
                             evalWriterCount +=1
                             writerEval.add_scalar("lossEval", lossTe.cpu().detach().numpy().item(),evalWriterCount)
+                        if trial is not None and iTe >= numBatchesForOptunaTe*batchSize:
+                            break
         trLosses.append(np.mean(epochLossTr))
         evalLosses.append(np.mean(epochLossE))
-        print('Epoch ',e,' mean eval Loss ',np.mean(epochLossE))
+        
+        if trial is not None:
+            trial.report(np.mean(epochLossE), e)
+            if trial.should_prune():
+                raise opt.exceptions.TrialPruned()
+        print('\nEpoch ',e,' mean eval Loss ',np.mean(epochLossE))
 
     # plot losses
 
@@ -185,17 +232,19 @@ def trainNN(trDl, evalDl,epochs=2):
     plt.plot(evalLosses, 'r.',label='Eval')
     plt.xlabel('Epochs')
     plt.ylabel('Eval')
-    plt.savefig(f'logs/{dateTimeNow}_Losses.png',dpi=200)
-    plt.show()
+    plt.savefig(f'logs/{dateTimeNow}_MeanEvalLoss_{np.mean(epochLossE):.3f}_Losses.png',dpi=200)
+    # plt.show()
     plt.close()
 
     return np.mean(epochLossE)
 
+#Datadir
 mainDir = r"E:\KaggleData\Tabular Playground Series - Jan 2021"
 
-epochs = 5
+#Hyperparameters and toggles
+epochs = 25
 lr = 6e-6
-batchSize = 32
+batchSize = 1024
 addL1Reg = True
 L1val = 0.004
 doLearningCurve = True
@@ -204,18 +253,39 @@ logTB = 0
 
 doShallows =False
 doPYNN = 0
-doLightning = 1
+doLightning = 0
 tuneModel = 0
 
+doOptuna = True
+#optuna Params
+possibleActiFuncs = ["ReLU","Sigmoid","LeakyReLU","Tanh"]
+minLayers = 1
+maxLayers = 6
+minNeurons = 20
+maxNeurons = 500 #TODO try powers of 2 with int suggest
+minDropOut = 0.
+maxDropOut = 0.7
+l1min = 1e-7
+l1max = 1e-2
+minLr = 1e-8
+maxLr = 1e-3
+maxTrials = 5
+maxTime = 60000
+numBatchesForOptunaTr = 30
+numBatchesForOptunaTe = 10
+
+#optuna shallow params
+possibleShallows = ["SVR","rfr","bayR"]
+
+#Toggles for data overview
 doPCA = False #looks to be unhelpful
 plotPCA = False
-
-checkHist = True
+checkHist = False #Target data looks like double normal distribution
+plotCorreclations = False
 
 os.chdir(mainDir)
-
-if logTB:
-    dateTimeNow =  datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+dateTimeNow =  datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+if logTB:    
     writerTr = SummaryWriter("logs/"+dateTimeNow+"TrainLosses")
     writerEval = SummaryWriter("logs/"+dateTimeNow+"EvalLosses")
 
@@ -239,10 +309,9 @@ if doPCA:
         xPCAplot = pcaPlot.transform(trainDataRaw.drop([targetCol, idCol],axis=1))
         yPCAplot = trTarget.copy()
         
-        try:
-            %matplotlib qt
-        except:
-            print('not in iPhython')
+        
+        #%matplotlib qt
+        
         fig = plt.figure()
         ax = fig.add_subplot(projection='3d')
         numSamples = 1000
@@ -253,15 +322,29 @@ if doPCA:
         plt.show()
         plt.close()
         
-        try:
-            %matplotlib inline
-        except:
-            print('not in iPhython')
+        #%matplotlib inline
+        
+            
+if plotCorreclations:
+    corrs = trainDataRaw.drop("id",axis=1).corr()
+    corrPlotThreshold = 1 # to check for weak correlations, cont11 and 12 correlate highly
+    sb.heatmap(corrs[(corrs < corrPlotThreshold)&(corrs > -corrPlotThreshold)])
+    plt.savefig('./AllCorrelations.png',dpi=300)
+    plt.show()
+    plt.close()
+    plt.show()
+    plt.close()
+    plt.plot(corrs.keys().drop("target"),corrs["target"].drop("target"),'k.')
+    plt.ylabel('Correlation with target')
+    plt.xticks(rotation=45)
+    plt.savefig('./CorrelationsWithTarget.png',dpi=300)
+    plt.show()
+    plt.close()
 
 if checkHist:
     plt.hist(trTarget,bins=200)
-    plt.xlim('Target Variable')
-    plt.ylim('Frequency')
+    plt.xlabel('Target Variable')
+    plt.ylabel('Frequency')
     plt.savefig('./TargetData_Histogram.png',dpi=300)
     plt.show()
     plt.close()
@@ -315,7 +398,7 @@ if doPYNN:
     if doLearningCurve:
         indsTr =np.arange(len(dSetTr))
         np.random.shuffle(indsTr)
-        subTrDl = dl(Subset(dSetTr,indsTr[:50000]),batch_size=batchSize)
+        subTrDl = dl(Subset(dSetTr,indsTr[:50000]),batch_size=batchSize,shuffle=True)
 
         nnNet = net(xTrT, yTrT).to(device)
         opti = t.optim.Adam(nnNet.parameters(), lr = lr)
@@ -396,3 +479,15 @@ if doLightning:
         # trainer.tune(model1,trDl)
     else:
         trainer.fit(model1, trDl)
+        
+if doOptuna:
+    criterion = nn.MSELoss()
+    study = opt.create_study(direction="minimize")
+    study.optimize(objective, n_trials=maxTrials, timeout=maxTime)
+    trial = study.best_trial
+    print('\nBest Study Parameters:')
+    
+    with open(f'./BestTrialParams{dateTimeNow}.txt','w+') as f:
+        for k, v in trial.params.items():
+            f.write(f"'{k}':{v}\n")
+            print(f"'{k}':{v},")
