@@ -9,7 +9,7 @@ Tabular Playground Series - Jan 2021
 import matplotlib.pyplot as plt
 import torch as t
 from torch.utils.data.dataloader import DataLoader as dl
-from torch.utils.data import TensorDataset, Dataset, random_split, Subset
+from torch.utils.data import TensorDataset, Dataset, Subset
 # from torch.utils.tensorboard import SummaryWriter
 import torch.nn as nn
 import torch.nn.functional as F
@@ -23,17 +23,18 @@ from sklearn.ensemble import RandomForestRegressor as rfr
 from sklearn.linear_model import BayesianRidge as bayR
 from sklearn.experimental import enable_hist_gradient_boosting
 from sklearn.ensemble import HistGradientBoostingRegressor as gradB
+import xgboost as xgb
 from sklearn.preprocessing import StandardScaler as ss
 from sklearn.model_selection import train_test_split as tts
-from sklearn.preprocessing import StandardScaler as ss
 from sklearn.metrics import mean_squared_error as mse
 from joblib import parallel_backend # to improve sklearn training speed
 import os
 import datetime
 from tensorboardX import SummaryWriter
 from sklearn.decomposition import PCA
-import pytorch_lightning as pl
 import optuna as opt
+from optuna.integration import PyTorchLightningPruningCallback
+import pickle
 
 #TODO implement optuna for shallows
 #TODO Rebalance data (Might not be needed)
@@ -42,66 +43,38 @@ import optuna as opt
 
 class LitModel(pl.LightningModule):
 
-    def __init__(self,x):
+    def __init__(self, x, trial=None):
         super().__init__()
-        self.lr = lr
-        self.l1 = nn.Linear(x.shape[1], 1)
+        if trial is not None:
+            self.lr = trial.suggest_float("lr", minLr, maxLr)
+            self.weight_decay =  trial.suggest_float("weight_decay", minWD, maxWD)
+        else:
+            self.lr = bestDict["lr"]
+            self.weight_decay =  weight_decay
+        self.model = makeModel(trial, bestDict)
 
     def forward(self, x):
-        return t.relu(self.l1(x.view(x.size(0), -1)))
+        return self.model(x.view(x.size(0), -1))
 
     def training_step(self, batch, batch_idx):
         x, y = batch
         y_hat = self(x)
-        loss = t.sqrt(F.mse_loss(y_hat, y))
-        self.log('train_loss', loss, prog_bar=True)
+        loss = F.mse_loss(y_hat, y)
+        self.log('train_loss', loss, prog_bar=True,on_epoch=True)
         return loss
 
     def configure_optimizers(self):
-       return t.optim.Adam(self.parameters(), lr=(self.lr or self.learning_rate))
+       return t.optim.Adam(self.parameters(), 
+                           lr=(self.lr or self.learning_rate))
 
-
-
-
-class lnet(pl.LightningModule):
-
-    def __init__(self, x, y):
-        super().__init__()
-        self.model = nn.Sequential(
-            nn.Linear(14,128),
-            nn.ReLU(),
-            nn.Linear(128,1))
-
-    def forward(self, x):
-        return self.model(x)
-
-    def training_step(self, batch, batch_idx):
+    def validation_step(self, batch, batch_idx):
         x, y = batch
-        # x = x.view(x.size(0),-1)
-        z = self(x)
-        loss = t.sqrt(F.mse_loss(y, z))
-        # self.log('train_loss', loss)
-        return loss
+        y_hat = self(x)
+        val_loss =F.mse_loss(y_hat, y)
+        self.log('val_loss', val_loss, prog_bar=True,on_epoch=True)
+        return val_loss
 
-    def configure_optimizers(self):
-        optimizer = t.optim.Adam(self.parameters(),
-                                 lr=lr)
-        # #,
-        #                          momentum=0.9,
-        #                          weight_decay=5e-4
-        return optimizer
 
-    # def validation_step(self, batch, batch_idx):
-    #     x, y, = batch
-    #     out = self(x)
-    #     val_loss  = F.cross_entropy(out, y)
-    #     return val_loss
-
-    # def test_step(self, batch, batch_idx):
-    #     x, y = batch
-    #     out = self(x)
-    #     loss = F.cross_entropy(out, y)
-    #     return loss
 
 class net(nn.Module):
 
@@ -139,26 +112,48 @@ class dset(Dataset):
         return (t.Tensor(x,dtype=t.float), t.Tensor(y,dtype=t.float))
 
 
-def makeModel(trial):
+def makeModel(trial = None, hpDict = None):
     # sets layers and number of neurons for each trial
     #builds dict with parameters that can be used to make best model
-    nl = trial.suggest_int("nL",minLayers,maxLayers)
     layers=[]
     inFeat = xTrT.shape[1] #assumes 1D data for each sample
     lastOut = yTrT.shape[1]
-
-    for i in range(nl):
-        outFeat = trial.suggest_int(f"n{i}",minNeurons,maxNeurons)
-        layers.append(nn.Linear(inFeat, outFeat))
-        actiLayer = trial.suggest_categorical(f"a{i}",possibleActiFuncs)
-        layers.append(getattr(nn, actiLayer)())
-        dropOutRatio = trial.suggest_float(f"dropoutL{i}",minDropOut,maxDropOut)
-        layers.append(nn.Dropout(dropOutRatio))
-        inFeat = outFeat
+    if trial is not None:
+        nl = trial.suggest_int("nL",minLayers,maxLayers)
+        
+        for i in range(nl):
+            outFeat = trial.suggest_int(f"n{i}",minNeurons,maxNeurons)
+            layers.append(nn.Linear(inFeat, outFeat))
+            actiLayer = trial.suggest_categorical(f"a{i}",possibleActiFuncs)
+            layers.append(getattr(nn, actiLayer)())
+            dropOutRatio = trial.suggest_float(f"dropoutL{i}",minDropOut,maxDropOut)
+            layers.append(nn.Dropout(dropOutRatio))
+            inFeat = outFeat
+            
+    elif hpDict is not None:
+        nl = hpDict["nL"]
+        
+        for i in range(nl):
+            outFeat = hpDict[f"n{i}"]
+            layers.append(nn.Linear(inFeat, outFeat))
+            actiLayer = hpDict[f"a{i}"]
+            layers.append(getattr(nn, actiLayer)())
+            dropOutRatio = hpDict[f"dropoutL{i}"]
+            layers.append(nn.Dropout(dropOutRatio))
+            inFeat = outFeat
+            
     layers.append(nn.Linear(inFeat, lastOut))
 
     return nn.Sequential(*layers)
 
+def runShallowOpt(model, modelname,idxSel):
+    with parallel_backend('threading', n_jobs=-1):
+            model.fit(xTrT[idxSel], yTrT[idxSel].reshape(-1))
+            trainLoss = mse(yTrT[idxSel].reshape(-1),model.predict(xTrT[idxSel]).reshape(-1))
+            evalLoss = mse(yET.reshape(-1),model.predict(xET).reshape(-1))
+            print(modelname,f' TrainLoss {trainLoss:.3f}, evalLoss: {evalLoss:.3f}')
+            return trainLoss, evalLoss
+        
 def shallowObjective(trial):
 
     modelname = trial.suggest_categorical("modelname",possibleShallows)
@@ -181,43 +176,73 @@ def shallowObjective(trial):
         else:
             coef0 = 0.
         model = SVR(kernel=kernel, degree=polyDeg, gamma=gamma, coef0=coef0, C=C,verbose=1)
-        with parallel_backend('threading', n_jobs=-1):
-            model.fit(xTrT[idxSel], yTrT[idxSel].reshape(-1))
-            trainLoss = mse(yTrT[idxSel].reshape(-1),model.predict(xTrT[idxSel]).reshape(-1))
-            evalLoss = mse(yET.reshape(-1),model.predict(xET).reshape(-1))
-            print(modelname,f' TrainLoss {trainLoss:.3f}, evalLoss: {evalLoss:.3f}')
-
+        
+        trainLoss, evalLoss = runShallowOpt(model, modelname,idxSel)
+        
     elif modelname == "rfr":
         n_estimators = trial.suggest_int("n_estimators",10,1000)
         max_features = trial.suggest_categorical("max_features",["sqrt","log2",None])
         max_depth = trial.suggest_int("max_depth",10,100)
         model = rfr(n_estimators=n_estimators,max_features=max_features,max_depth=max_depth,verbose=1)
-        with parallel_backend('threading', n_jobs=-1):
-            model.fit(xTrT[idxSel], yTrT[idxSel].reshape(-1))
-            trainLoss = mse(yTrT[idxSel].reshape(-1),model.predict(xTrT[idxSel]).reshape(-1))
-            evalLoss = mse(yET.reshape(-1),model.predict(xET).reshape(-1))
-            print(modelname,f' TrainLoss {trainLoss:.3f}, evalLoss: {evalLoss:.3f}')
-
+        
+        trainLoss, evalLoss = runShallowOpt(model, modelname,idxSel)
+        
     elif modelname == "gradB":
         learning_rate = trial.suggest_float("learning_rate",1e-4,1e0,log=True)
         max_leaf_nodes = trial.suggest_int("max_leaf_nodes",1,500)
         max_depth = trial.suggest_int("max_depth",10,100)
         model = gradB(learning_rate=learning_rate,max_leaf_nodes=max_leaf_nodes,max_depth=max_depth,verbose=1)
-        with parallel_backend('threading', n_jobs=-1):
-            model.fit(xTrT[idxSel], yTrT[idxSel].reshape(-1))
-            trainLoss = mse(yTrT[idxSel].reshape(-1),model.predict(xTrT[idxSel]).reshape(-1))
-            evalLoss = mse(yET.reshape(-1),model.predict(xET).reshape(-1))
-            print(modelname,f' TrainLoss {trainLoss:.3f}, evalLoss: {evalLoss:.3f}')
+        
+        trainLoss, evalLoss = runShallowOpt(model, modelname,idxSel)
+        
+    elif modelname == 'xgboost':
+        # lambdaVal = trial.suggest_float("lambdaVal",1e-5,1e0,log=True)
+        # alpha = trial.suggest_float("alpha",1e-5,1e0,log=True)
+        # learning_rate = trial.suggest_float("learning_rate",1e-5,1e0,log=True)
+        # max_depth = trial.suggest_int("max_depth",1,500)
+        # n_estimators = trial.suggest_int("n_estimators",10,10000)
+        # min_child_weight = trial.suggest_int("min_child_weight",1,500)
+        paramDict = {
+            "lambda" : trial.suggest_float("lambdaVal",1e-5,1e0,log=True),
+            "alpha" : trial.suggest_float("alpha",1e-5,1e0,log=True),
+            "learning_rate" : trial.suggest_float("learning_rate",1e-5,1e0,log=True),
+            "max_depth" : trial.suggest_int("max_depth",1,20),
+            "n_estimators" : trial.suggest_int("n_estimators",10,10000),
+            "min_child_weight" : trial.suggest_int("min_child_weight",1,500),
+            'tree_method':'gpu_hist',
+            'predictor': 'gpu_predictor'
+            }
+        
+        model = xgb.XGBRegressor(**paramDict)
+        trainLoss, evalLoss = runShallowOpt(model, modelname,idxSel)
     return evalLoss
 
 
+
+def litObjective(trial):
+    
+    model = LitModel(xTrT[:1000],trial=trial)
+    trainer= pl.Trainer(
+        limit_val_batches = 0.2,
+        logger = tb_logger, max_epochs=epochs, gpus=1,
+        callbacks=[PyTorchLightningPruningCallback(
+            trial, monitor="val_loss")])
+    hyperP = trial.params
+    trainer.logger.log_hyperparams(hyperP)
+    trainer.fit(model,train_dataloader=trDl,val_dataloaders=evalDl)
+    return trainer.callback_metrics["val_loss"].item()
+    
+    
 def objective(trial):
 
-    model = makeModel(trial).to(device)
+    model = makeModel(trial, hpDict=None).to(device)
     lr = trial.suggest_float("lr", minLr, maxLr, log=True)
+    weight_decay = trial.suggest_float("weight_decay",1e-8,1e-2, log=True)
 
-    opti = t.optim.Adam(model.parameters(),lr = lr)
-    evalLossMean = trainNN(model,opti,trDl, evalDl,epochs=epochs, trial=trial)
+    opti = t.optim.Adam(model.parameters(),lr = lr,
+                        weight_decay=weight_decay)
+    evalLossMean = trainNN(model,opti,trDl, evalDl,epochs=epochs,
+                           trial=trial)
     return evalLossMean
 
 def trainNN(nnNet,opti,trDl, evalDl,epochs=2, trial=None):
@@ -226,6 +251,9 @@ def trainNN(nnNet,opti,trDl, evalDl,epochs=2, trial=None):
     evalWriterCount=0
     trLosses =[]
     evalLosses = []
+    print('Trial check: ', trial is None)
+    if 'bestDict' in globals():
+        L1val = bestDict["L1val"]
     if trial is not None:
         L1val = trial.suggest_float("L1val",l1min,l1max,log=True)
     for e in tqdm(range(epochs)):
@@ -248,6 +276,7 @@ def trainNN(nnNet,opti,trDl, evalDl,epochs=2, trial=None):
                 writerCount+=1
                 writerTr.add_scalar("lossTr", lossTr.cpu().detach().numpy().item(),writerCount)
             if trial is not None and i >= numBatchesForOptunaTr*batchSize:
+                
                 break
 
 
@@ -275,6 +304,7 @@ def trainNN(nnNet,opti,trDl, evalDl,epochs=2, trial=None):
             trial.report(np.mean(epochLossE), e)
             if trial.should_prune():
                 raise opt.exceptions.TrialPruned()
+        print('\nEpoch ',e,' mean train Loss ',np.mean(epochLossTr))
         print('\nEpoch ',e,' mean eval Loss ',np.mean(epochLossE))
 
     # plot losses
@@ -289,57 +319,105 @@ def trainNN(nnNet,opti,trDl, evalDl,epochs=2, trial=None):
 
     return np.mean(epochLossE)
 
+
+def saveBestTrial(study,name):
+    
+    trial = study.best_trial
+    print('\nBest Study Parameters:')
+
+    with open(f'./BestTrialParams{dateTimeNow}_{name}.txt','w+') as f:
+        for k, v in trial.params.items():
+            f.write(f"'{k}':{v}\n")
+            print(f"'{k}':{v},")
+    with open(f'./BestTrialParams{dateTimeNow}_{name}.pkl','wb') as f:
+        pickle.dump(trial.params, f)
+
 #Datadir
 mainDir = r"E:\KaggleData\Tabular Playground Series - Jan 2021"
 
 #Hyperparameters and toggles
-epochs = 50
+epochs = 25
 lr = 6e-6
 batchSize = 1024
 addL1Reg = True
 L1val = 0.004
+weight_decay = 1e-4
 doLearningCurve = False
 
-logTB = 0
+logTB = True
+logTB_lightining = True
 
-doShallows =False
-doPYNN = True
+doShallows =1
+doPYNN = 0
 doLightning = 0
 tuneModel = 0
 
-doOptuna = True
+doOptuna = 1 #applies to all methods above
+
 #optuna Params
 possibleActiFuncs = ["ReLU"] #,"Sigmoid","LeakyReLU","Tanh"
 minLayers = 1
-maxLayers = 6
+maxLayers = 10
 minNeurons = 20
-maxNeurons = 500 #TODO try powers of 2 with int suggest
+maxNeurons = 1000 #TODO try powers of 2 with int suggest
 minDropOut = 0.
 maxDropOut = 0.7
-l1min = 1e-7
+l1min = 1e-7 #not used for lightning
 l1max = 1e-2
-minLr = 1e-8
-maxLr = 1e-3
-maxTrials = 100
+minWD = 1e-6
+maxWD = 5e-3 #used for lightning
+minLr = 1e-7
+maxLr = 1e-2
+maxTrials = 20
 maxTime = 60000
 numBatchesForOptunaTr = 30
 numBatchesForOptunaTe = 20
 
 #optuna shallow params
-possibleShallows = ["rfr","gradB"]#,"SVR","bayR","gradB"
+possibleShallows = ["xgboost"]#,"SVR","bayR","gradB","xgboost"
 numShallowSamples = 50000
 
 #Toggles for data overview
 doPCA = False #looks to be unhelpful
+logRedistr = False # might not be the best
 plotPCA = False
 checkHist = False #Target data looks like double normal distribution
 plotCorreclations = False
 
+
+#best (BestTrialParams20210703-170634) currently causes overfitting
+bestDict ={
+    'nL':6,
+    'n0':435,
+    'a0':'ReLU',
+    'dropoutL0':0.41252116154797547,
+    'n1':234,
+    'a1':'ReLU',
+    'dropoutL1':0.3705802089015725,
+    'n2':364,
+    'a2':'ReLU',
+    'dropoutL2':0.17624519916649536,
+    'n3':493,
+    'a3':'ReLU',
+    'dropoutL3':0.010860518403366382,
+    'n4':252,
+    'a4':'ReLU',
+    'dropoutL4':0.21194478383187768,
+    'n5':500,
+    'a5':'ReLU',
+    'dropoutL5':0.03323032803874664,
+    'lr':0.0004610912753128815,
+    'L1val':1.395796158400521e-07
+    }
+    
+    
 os.chdir(mainDir)
 dateTimeNow =  datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-if logTB:
+if logTB and doPYNN:
     writerTr = SummaryWriter("logs/"+dateTimeNow+"TrainLosses")
     writerEval = SummaryWriter("logs/"+dateTimeNow+"EvalLosses")
+if logTB_lightining and doLightning:
+    tb_logger = pl.loggers.TensorBoardLogger('lightning_logs/')
 
 trainDataRaw = pd.read_csv("train.csv")
 testDataRaw = pd.read_csv("test.csv")
@@ -375,6 +453,8 @@ if doPCA:
         plt.close()
 
         #%matplotlib inline
+if logRedistr:
+    trTarget = np.log1p(trTarget)
 
 
 if plotCorreclations:
@@ -425,6 +505,24 @@ evalDl = dl(dSetE,batch_size=batchSize,shuffle=True)
 
 # Shallow tests
 
+def runShallow(model):
+    with parallel_backend('threading', n_jobs=-1):
+        model.fit(xTrT, yTrT.reshape(-1))
+        mseLoss = mse(model.predict(xTrT), yTrT)
+        pred = model.predict(teDT)
+        predSub = ssTarget.inverse_transform(pred)
+    return model, mseLoss, predSub
+
+def saveSubmission(data,name):
+    dfSubmission = pd.DataFrame(data=data,
+                                index=np.arange(0,len(data)*2,2))
+    dfSubmission.reset_index(inplace=True)
+    dfSubmission.columns = ['id','target']
+    dfSubmission.id = testDataRaw.id
+    # dfSubmission.rename({'index':'id'},inplace=True)
+    dfSubmission.to_csv(f'logs/{dateTimeNow}_{name}_Submission.csv',index=False)
+
+
 if doShallows:
 
     if doOptuna:
@@ -432,27 +530,36 @@ if doShallows:
         studyShallow.optimize(shallowObjective, maxTrials)
         shallowTrial = studyShallow.best_trial
         print(shallowTrial)
-        with open(f'./Shallow_BestTrialParams{dateTimeNow}.txt','w+') as f:
-            for k, v in shallowTrial.params.items():
-                f.write(f"'{k}':{v}\n")
-                print(f"'{k}':{v},")
+        saveBestTrial(studyShallow,'Shallow')        
+        opt.visualization.plot_param_importances(studyShallow)
     else:
-        ranForest = rfr(verbose=1) # mse: 0.130517
+        bestModDict = {
+        'modelname':rfr,
+        'n_estimators':978,
+        'max_features':'log2',
+        'max_depth':81
+        } #scores 0.70455
+        ranForest = rfr(
+            n_estimators=978,
+            max_features='log2',
+            max_depth=81,
+            verbose=1)
         bay = bayR(verbose=1)
         svr = SVR(verbose=1)
-
-        bay.fit(xTrT, yTrT)
-        bay = mse(bay.predict(xTrT),yTrT)
-        print('Forest MSE: ',np.sqrt(bay))
-
-
+        ranForest, mseLoss, predSub = runShallow(ranForest)
+        print('Forest RMSE: ',np.sqrt(mseLoss))
+        saveSubmission(predSub, 'Shallow')
+        
 
 
 # nn approach
 device = t.device('cuda') if t.cuda.is_available() else t.device('cpu')
 writerCount = 0
 evalWriterCount = 0
+
+        
 if doPYNN:
+    
 
     if doOptuna:
         criterion = nn.MSELoss()
@@ -465,47 +572,58 @@ if doPYNN:
             for k, v in trial.params.items():
                 f.write(f"'{k}':{v}\n")
                 print(f"'{k}':{v},")
+        with open(f'./BestTrialParams{dateTimeNow}.pkl','wb') as f:
+            pickle.dump(trial.params, f)
+        opt.visualization.plot_param_importances(study)
     elif doLearningCurve:
         indsTr =np.arange(len(dSetTr))
         np.random.shuffle(indsTr)
         subTrDl = dl(Subset(dSetTr,indsTr[:50000]),batch_size=batchSize,shuffle=True)
 
-        nnNet = net(xTrT, yTrT).to(device)
-        opti = t.optim.Adam(nnNet.parameters(), lr = lr)
+        nnNet = makeModel(bestDict).to(device)
+        opti = t.optim.Adam(nnNet.parameters(), lr = bestDict["lr"])
         criterion = nn.MSELoss()
 
-        evalLossFromTrain = trainNN(subTrDl, evalDl, epochs=3)
+        evalLossFromTrain = trainNN(nnNet,opti,subTrDl, evalDl, epochs=10)
         print('Final Loss val ', evalLossFromTrain)
 
     else:
-        nnNet = net(xTrT, yTrT).to(device)
-        opti = t.optim.Adam(nnNet.parameters(), lr = lr)
+        nnNet = makeModel(hpDict=bestDict).to(device)
+        opti = t.optim.Adam(
+            nnNet.parameters(), lr = bestDict["lr"],
+            weight_decay=1e-3)
         criterion = nn.MSELoss()
 
-        evalLossFromTrain = trainNN(trDl, evalDl)
-        print('Final Loss val ', evalLossFromTrain)
+        evalLossFromTrain = trainNN(nnNet,opti,trDl, evalDl,epochs = epochs)
+        print('Final Loss val ', evalLossFromTrain, 'RMSE: ',np.sqrt(evalLossFromTrain))
 
         nnNet.eval()
         submissionY = nnNet(t.Tensor(teDT).to(device)).cpu().detach().numpy()
-        dfSubmission = pd.DataFrame(data=submissionY,
-                                    index=np.arange(0,len(submissionY)))
-        dfSubmission.reset_index(inplace=True)
-        dfSubmission.columns = ['id','target']
-        # dfSubmission.rename({'index':'id'},inplace=True)
-        dfSubmission.to_csv(f'logs/{dateTimeNow}_Submission.csv',index=False)
+        saveSubmission(submissionY, 'Deep')
+       
 
 ## nn with LightningModule
 if doLightning:
-    trDl = dl(TensorDataset(t.Tensor(xTrT).float(), t.Tensor(yTrT).float()),
-              batch_size=batchSize,shuffle=True)
-
-    trainer = pl.Trainer(gpus=1,max_epochs=epochs,stochastic_weight_avg=True)
-    model1 = LitModel(t.Tensor(xTrT[:50]).float())
-    if tuneModel:
-        lr_finder = trainer.tuner.lr_find(model1,trDl)
-        fig = lr_finder.plot(suggest=True)
-        fig.show()
-        new_lr = lr_finder.suggestion()
-        # trainer.tune(model1,trDl)
+    
+    if doOptuna:
+        
+        bestDict = None
+        study = opt.create_study(direction="minimize", pruner=opt.pruners.MedianPruner())
+        study.optimize(litObjective,n_trials=maxTrials, timeout=maxTime)
+        saveBestTrial(study, 'Lightning')
+        #Visualize parameter importances.
+        opt.visualization.plot_param_importances(study)
     else:
-        trainer.fit(model1, trDl)
+        with open('BestTrialParams20210704-125835_Lightning.pkl','rb') as f:
+            bestDict = pickle.load(f)
+         
+        trainer = pl.Trainer(gpus=1,max_epochs=epochs,stochastic_weight_avg=True, logger=tb_logger)
+        model1 = LitModel(t.Tensor(xTrT[:50]).float())
+        if tuneModel:
+            lr_finder = trainer.tuner.lr_find(model1,trDl,evalDl)
+            fig = lr_finder.plot(suggest=True)
+            fig.show()
+            new_lr = lr_finder.suggestion()
+            # trainer.tune(model1,trDl)
+        else:
+            trainer.fit(model1, trDl, evalDl)
