@@ -29,6 +29,7 @@ from sklearn.ensemble import RandomForestRegressor as rfr
 from sklearn.linear_model import BayesianRidge as bayR
 from sklearn.experimental import enable_hist_gradient_boosting
 from sklearn.ensemble import HistGradientBoostingRegressor as gradB
+from sklearn.multioutput import MultiOutputRegressor
 import xgboost as xgb
 from sklearn.preprocessing import StandardScaler as ss
 from sklearn.model_selection import train_test_split as tts
@@ -42,6 +43,7 @@ from sklearn.decomposition import PCA
 import optuna as opt
 from optuna.integration import PyTorchLightningPruningCallback
 import pickle
+
 
 #TODO implement optuna for shallows
 #TODO Rebalance data (Might not be needed)
@@ -348,7 +350,7 @@ uses mean column-wise root mean squared logarithmic error
 """
 
 #Hyperparameters and toggles
-epochs = 25
+epochs = 50
 lr = 6e-6
 batchSize = 1024
 addL1Reg = True
@@ -391,10 +393,10 @@ numShallowSamples = 50000
 
 #Toggles for data overview
 doPCA = False #looks to be unhelpful
-logRedistr = 1 # might not be the best
+logRedistr = 0 # might not be the best
 plotPCA = False
-checkHist = 1 #Target data looks like double normal distribution
-plotCorreclations = 1
+checkHist = False #Target data looks like double normal distribution
+plotCorreclations = False
 
 
 #best (BestTrialParams20210703-170634) currently causes overfitting
@@ -441,11 +443,54 @@ trD = trainDataRaw.drop([*targetCols,idCol],axis=1).copy()
 teD = testDataRaw.copy().drop([idCol],axis=1)
 trTarget = trainDataRaw[targetCols]
 
+#create extra features from previous data points
+pastPoints = 3 # this number -1 is number of new features per column
+col="deg_C"
+# for p in range(pastPoints):
+#     for i in range(1,len(trD)):
+#         trD.at[i,f"{col}-{p}"] = trD.at[i-p,col]
+
+def addPastDataFeatures(df,pastPoints,cols):
+    """
+    Pass cols as list even if single
+    pastPoints is how far into the past to go
+    """
+    for p in range(1,pastPoints):
+        for col in cols:
+            oldColName = col
+            newColName = f"{col}-{p}"
+            df.at[:p-1,newColName] = df.at[0,oldColName]
+            for i in range(p,len(df)):
+                df.at[i,newColName] = df.at[i-p,oldColName]
+    return df
+
+allCols = list(trD.keys())
+trD = addPastDataFeatures(trD, pastPoints, allCols)
+teD = addPastDataFeatures(teD, pastPoints, allCols)
+
+trD.to_html('trD.html')
+        
+
 from sklearn.model_selection import TimeSeriesSplit
 
-seqLength = 10
-numOfSeqs = np.floor(len(trD)/seqLength)
-timeSplitter = TimeSeriesSplit(n_splits=numOfSeqs,max_train_size=seqLength,test_size=5)
+#timesplitter used for validation not main training
+#timeSplitter = TimeSeriesSplit(n_splits=numOfSeqs,max_train_size=seqLength,test_size=2)
+
+# xTrain = np.empty((numOfSeqs, 10,8))
+# yTrain = np.empty((numOfSeqs, 10,3))
+# for i,(trainIndex, testIndex) in enumerate(timeSplitter.split(X=trD,y=trTarget)):
+
+#     print('x data shape',trD.to_numpy()[trainIndex].shape, trD.to_numpy()[testIndex].shape)
+#     print('y data shape',trTarget.to_numpy()[trainIndex].shape, trTarget.to_numpy()[testIndex].shape)
+#     xTrain= trD.to_numpy()[trainIndex]
+#     yTrain= trTarget.to_numpy()[trainIndex]
+#     if i>5:break
+
+splitRatio = 0.7
+xTr = trD.to_numpy()[:int(len(trD)*splitRatio)]
+xTe= trD.to_numpy()[int(len(trD)*splitRatio):]
+yTr = trTarget.to_numpy()[:int(len(trD)*splitRatio)]
+yTe = trTarget.to_numpy()[int(len(trD)*splitRatio):]
 
 
 if doPCA:
@@ -501,18 +546,16 @@ if checkHist:
         plt.show()
         plt.close()
 
-xTr, xE, yTr, yE = tts(trD, trTarget)
-
 # Normalise
 ssTr = ss().fit(xTr)
 
 xTrT = ssTr.transform(xTr)
-xET = ssTr.transform(xE)
+xET = ssTr.transform(xTe)
 teDT = ssTr.transform(teD)
 
-ssTarget = ss().fit(yTr.to_numpy())
-yTrT = ssTarget.transform(yTr.to_numpy())
-yET = ssTarget.transform(yE.to_numpy())
+ssTarget = ss().fit(yTr)
+yTrT = ssTarget.transform(yTr)
+yET = ssTarget.transform(yTe)
 
 #make Dataloaders
 dSetTr = TensorDataset(t.Tensor(xTrT), t.Tensor(yTrT))
@@ -520,19 +563,20 @@ dSetE = TensorDataset(t.Tensor(xET), t.Tensor(yET))
 
 dSetTr2 = dset(xTrT, yTrT)
 dSetE2 = dset(xET,yET)
-trDl = dl(dSetTr,batch_size=batchSize,shuffle=True)
-evalDl = dl(dSetE,batch_size=batchSize,shuffle=True)
+trDl = dl(dSetTr,batch_size=batchSize,shuffle=False)
+evalDl = dl(dSetE,batch_size=batchSize,shuffle=False)
 
 # Shallow tests
 
 def runShallow(model):
     with parallel_backend('threading', n_jobs=-1):
         model.fit(xTrT, yTrT)
-        mseLoss = mse(model.predict(xTrT), yTrT)
-        mslrLoss = mslr(model.predict(xTrT), yTrT)
+        mseLoss = mse(model.predict(xET), yET) 
+        yTePred = model.predict(xET)        
+        rmsleLoss = np.sqrt(np.mean(np.square(np.log10(yTePred+1)-np.log10(yET+1))))
         pred = model.predict(teDT)
         predSub = ssTarget.inverse_transform(pred)
-    return model, mseLoss, mslrLoss, predSub
+    return model, mseLoss,  predSub,rmsleLoss
 
 def saveSubmission(data,name):
     dfSubmission = pd.DataFrame(data=data,
@@ -557,11 +601,19 @@ if doShallows:
         
         with open(r'E:\KaggleData\Tabular Playground Series - Jan 2021/BestTrialParams20210704-145220_Shallow.pkl','rb') as f:
             paramDict=pickle.load(f)
+        paramDict ['tree_method']='gpu_hist'
+        paramDict ['predictor']='gpu_predictor' 
+        if "lambdaVal" in paramDict.keys():
+            paramDict["lambda"] = paramDict["lambdaVal"]
+            del paramDict["lambdaVal"]
+        if "modelname" in paramDict.keys():
+            del paramDict["modelname"]
         #BestTrialParams20210704-145220_Shallow.pkl
-        xgbModel = xgb.XGBRegressor(**paramDict)
-        xgbModel, mseLossXG,mslrLossXG, predSubXG = runShallow(xgbModel)
-        print('Forest RMSE: ',np.sqrt(mseLossXG))
-        print('Forest mslrLoss: ',np.sqrt(mslrLossXG))
+        #multi reg seems to crash kernel
+        multiReg = MultiOutputRegressor(xgb.XGBRegressor(**paramDict))
+        
+        #multiReg, mseLossXG, predSubXG = runShallow(multiReg)
+        #print('XGBoost RMSE: ',np.sqrt(mseLossXG))
         
         bestModDict = {
         'modelname':rfr,
@@ -569,16 +621,25 @@ if doShallows:
         'max_features':'log2',
         'max_depth':81
         } #scores 0.70455
-        ranForest = rfr(
+
+        multiRegForest = MultiOutputRegressor(
+            rfr(
             n_estimators=978,
             max_features='log2',
             max_depth=81,
             verbose=1)
+        )
+        # ranForest = rfr(
+        #     n_estimators=978,
+        #     max_features='log2',
+        #     max_depth=81,
+        #     verbose=1)
         bay = bayR(verbose=1)
         svr = SVR(verbose=1)
-        ranForest, mseLoss,mslrLoss, predSub = runShallow(ranForest)
-        print('Forest RMSE: ',np.sqrt(mseLoss))
-        print('Forest mslrLoss: ',np.sqrt(mslrLoss))
+        #multiRegForest.fit(xTrT,yTrT)
+        ranForest, mseLoss, predSub, rmsleLoss = runShallow(multiRegForest)
+        print('Forest MSE: ',mseLoss)
+        print('Forest RMSLE: ', rmsleLoss)
         saveSubmission(predSub, 'Shallow')
         
 
@@ -648,7 +709,8 @@ if doLightning:
         with open('BestTrialParams20210704-125835_Lightning.pkl','rb') as f:
             bestDict = pickle.load(f)
          
-        trainer = pl.Trainer(gpus=1,max_epochs=epochs,stochastic_weight_avg=True, logger=tb_logger)
+        trainer = pl.Trainer(
+            gpus=1,max_epochs=epochs,stochastic_weight_avg=True, logger=tb_logger)
         model1 = LitModel(t.Tensor(xTrT[:50]).float())
         if tuneModel:
             lr_finder = trainer.tuner.lr_find(model1,trDl,evalDl)
