@@ -32,6 +32,7 @@ from sklearn.ensemble import HistGradientBoostingRegressor as gradB
 from sklearn.multioutput import MultiOutputRegressor
 import xgboost as xgb
 from sklearn.preprocessing import StandardScaler as ss
+from sklearn.preprocessing import PowerTransformer
 from sklearn.model_selection import train_test_split as tts
 from sklearn.metrics import mean_squared_error as mse
 from sklearn.metrics import mean_squared_log_error as mslr
@@ -43,6 +44,8 @@ from sklearn.decomposition import PCA
 import optuna as opt
 from optuna.integration import PyTorchLightningPruningCallback
 import pickle
+
+from scipy import stats
 
 
 #TODO implement optuna for shallows
@@ -157,23 +160,38 @@ def makeModel(trial = None, hpDict = None):
 
 def runShallowOpt(model, modelname,idxSel):
     with parallel_backend('threading', n_jobs=-1):
-            model.fit(xTrT[idxSel], yTrT[idxSel])
-            trainLoss = mse(yTrT[idxSel].reshape(-1),model.predict(xTrT[idxSel]).reshape(-1))
-            evalLoss = mse(yET.reshape(-1),model.predict(xET).reshape(-1))
-            print(modelname,f' TrainLoss {trainLoss:.3f}, evalLoss: {evalLoss:.3f}')
-            return trainLoss, evalLoss
+        model.fit(xTrT, yTrT)
+    yTrPred = model.predict(xTrT) 
+    mseLossTrain = mse(yTrPred, yTrT)
+    yEPred = model.predict(xET) 
+    mseLoss = mse(yEPred, yET)
+    yTrPredInvTrans = ssTarget.inverse_transform(yTrPred)
+    yEPredInvTrans = ssTarget.inverse_transform(yEPred)
+    yETInvTrans = ssTarget.inverse_transform(yET)
+    yTrInvTrans = ssTarget.inverse_transform(yTrT)
+    rmsleLossTr = np.sqrt(np.mean(np.square(np.log10(yTrPredInvTrans+1)-np.log10(yTrInvTrans+1))))
+    rmsleLoss = np.sqrt(np.mean(np.square(np.log10(yEPredInvTrans+1)-np.log10(yETInvTrans+1))))
+    pred = model.predict(teDT)
+    predSub = ssTarget.inverse_transform(pred)
+    print(modelname,f' TrainLoss {rmsleLossTr:.3f}, evalLoss: {rmsleLoss:.3f}')
+    return rmsleLossTr, rmsleLoss
+
+
         
 def shallowObjective(trial):
 
     modelname = trial.suggest_categorical("modelname",possibleShallows)
     idxArr = np.arange(len(xTrT))
     np.random.shuffle(idxArr)
-    idxSel = idxArr[:numShallowSamples]
+    if numShallowSamples >= len(xTrT):
+        idxSel = idxArr
+    else:
+        idxSel = idxArr[:numShallowSamples]
     if modelname == "SVR":
         C = trial.suggest_float("C",1e0,1e4,log=True)
         kernel = trial.suggest_categorical("kernel", ["linear", "poly", "rbf", "sigmoid"])
         if kernel == 'poly':
-            polyDeg = trial.suggest_int("polyDeg",2,6)
+            polyDeg = trial.suggest_int("degree",2,6)
         else:
             polyDeg = 3
         if kernel in ['rbf','poly','sigmoid']:
@@ -185,24 +203,24 @@ def shallowObjective(trial):
         else:
             coef0 = 0.
         model = SVR(kernel=kernel, degree=polyDeg, gamma=gamma, coef0=coef0, C=C,verbose=1)
-        
-        trainLoss, evalLoss = runShallowOpt(model, modelname,idxSel)
+        multiRegModel = MultiOutputRegressor(model)
+        trainLoss, evalLoss = runShallowOpt(multiRegModel, modelname,idxSel)
         
     elif modelname == "rfr":
         n_estimators = trial.suggest_int("n_estimators",10,1000)
         max_features = trial.suggest_categorical("max_features",["sqrt","log2",None])
         max_depth = trial.suggest_int("max_depth",10,100)
         model = rfr(n_estimators=n_estimators,max_features=max_features,max_depth=max_depth,verbose=1)
-        
-        trainLoss, evalLoss = runShallowOpt(model, modelname,idxSel)
+        multiRegModel = MultiOutputRegressor(model)
+        trainLoss, evalLoss = runShallowOpt(multiRegModel, modelname,idxSel)
         
     elif modelname == "gradB":
         learning_rate = trial.suggest_float("learning_rate",1e-4,1e0,log=True)
         max_leaf_nodes = trial.suggest_int("max_leaf_nodes",1,500)
         max_depth = trial.suggest_int("max_depth",10,100)
         model = gradB(learning_rate=learning_rate,max_leaf_nodes=max_leaf_nodes,max_depth=max_depth,verbose=1)
-        
-        trainLoss, evalLoss = runShallowOpt(model, modelname,idxSel)
+        multiRegModel = MultiOutputRegressor(model)
+        trainLoss, evalLoss = runShallowOpt(multiRegModel, modelname,idxSel)
         
     elif modelname == 'xgboost':
         # lambdaVal = trial.suggest_float("lambdaVal",1e-5,1e0,log=True)
@@ -223,7 +241,8 @@ def shallowObjective(trial):
             }
         
         model = xgb.XGBRegressor(**paramDict)
-        trainLoss, evalLoss = runShallowOpt(model, modelname,idxSel)
+        multiRegModel = MultiOutputRegressor(model)
+        trainLoss, evalLoss = runShallowOpt(multiRegModel, modelname,idxSel)
     return evalLoss
 
 
@@ -350,7 +369,8 @@ uses mean column-wise root mean squared logarithmic error
 """
 
 #Hyperparameters and toggles
-epochs = 50
+splitRatio = 0.9 #for train eval split
+epochs = 5
 lr = 6e-6
 batchSize = 1024
 addL1Reg = True
@@ -361,9 +381,9 @@ doLearningCurve = False
 logTB = True
 logTB_lightining = True
 
-doShallows =1
+doShallows =0
 doPYNN = 0
-doLightning = 0
+doLightning = 1
 tuneModel = 0
 
 doOptuna = 0 #applies to all methods above
@@ -382,21 +402,29 @@ minWD = 1e-6
 maxWD = 5e-3 #used for lightning
 minLr = 1e-7
 maxLr = 1e-2
-maxTrials = 2
+maxTrials = 10
 maxTime = 60000
 numBatchesForOptunaTr = 30
 numBatchesForOptunaTe = 20
 
 #optuna shallow params
-possibleShallows = ["xgboost"]#,"SVR","bayR","gradB","xgboost"
+possibleShallows = ["rfr","SVR","gradB","xgboost"]#"rfr","SVR","gradB","xgboost"
 numShallowSamples = 50000
 
-#Toggles for data overview
+#Toggles for data augmentation overview
 doPCA = False #looks to be unhelpful
+doBoxCox = 1
 logRedistr = 0 # might not be the best
+duplicateUnderrepData = True
+dupliFac = 3 #how many times the data should be appended
+
+#create extra features from previous data points
+pastPoints = 3 # this number -1 is number of new features per column
+
 plotPCA = False
-checkHist = False #Target data looks like double normal distribution
-plotCorreclations = False
+checkHist = 1 #Target data looks like double normal distribution
+plotCorreclations = 1
+printDataStats = 0
 
 
 #best (BestTrialParams20210703-170634) currently causes overfitting
@@ -438,17 +466,32 @@ testDataRaw = pd.read_csv("test.csv")
 
 targetCols = ["target_carbon_monoxide","target_benzene","target_nitrogen_oxides"]
 idCol = "date_time"
+trainingCols = list(trainDataRaw.columns)
+for col in targetCols.copy():
+    trainingCols.remove(col)
+trainingCols.remove(idCol)
 
 trD = trainDataRaw.drop([*targetCols,idCol],axis=1).copy()
 teD = testDataRaw.copy().drop([idCol],axis=1)
-trTarget = trainDataRaw[targetCols]
+trTarget = trainDataRaw[targetCols].copy()
 
-#create extra features from previous data points
-pastPoints = 3 # this number -1 is number of new features per column
-col="deg_C"
-# for p in range(pastPoints):
-#     for i in range(1,len(trD)):
-#         trD.at[i,f"{col}-{p}"] = trD.at[i-p,col]
+
+if logRedistr:
+    trTargetBefore = np.round(trTarget.copy(),10)
+    trTarget = np.round(np.log1p(trTarget),10)
+    trTargetRecovered = np.round(np.exp(trTarget)-1,10)
+    print('Recovery difference: ', np.sum((trTargetRecovered-trTargetBefore)))
+
+
+if duplicateUnderrepData:
+    for i in range(dupliFac):
+        extraData = trTarget[trTarget["target_benzene"]>=0.2]
+        extraData = extraData.append(extraData)
+    trTarget = trTarget.append(extraData)
+
+
+# plt.hist(trTarget[trTarget["target_benzene"]<20]["target_benzene"],200)
+
 
 def addPastDataFeatures(df,pastPoints,cols):
     """
@@ -471,28 +514,6 @@ teD = addPastDataFeatures(teD, pastPoints, allCols)
 trD.to_html('trD.html')
         
 
-from sklearn.model_selection import TimeSeriesSplit
-
-#timesplitter used for validation not main training
-#timeSplitter = TimeSeriesSplit(n_splits=numOfSeqs,max_train_size=seqLength,test_size=2)
-
-# xTrain = np.empty((numOfSeqs, 10,8))
-# yTrain = np.empty((numOfSeqs, 10,3))
-# for i,(trainIndex, testIndex) in enumerate(timeSplitter.split(X=trD,y=trTarget)):
-
-#     print('x data shape',trD.to_numpy()[trainIndex].shape, trD.to_numpy()[testIndex].shape)
-#     print('y data shape',trTarget.to_numpy()[trainIndex].shape, trTarget.to_numpy()[testIndex].shape)
-#     xTrain= trD.to_numpy()[trainIndex]
-#     yTrain= trTarget.to_numpy()[trainIndex]
-#     if i>5:break
-
-splitRatio = 0.7
-xTr = trD.to_numpy()[:int(len(trD)*splitRatio)]
-xTe= trD.to_numpy()[int(len(trD)*splitRatio):]
-yTr = trTarget.to_numpy()[:int(len(trD)*splitRatio)]
-yTe = trTarget.to_numpy()[int(len(trD)*splitRatio):]
-
-
 if doPCA:
     pca = PCA(n_components=10).fit(trD)
     trD = pca.transform(trD)
@@ -502,7 +523,6 @@ if doPCA:
         pcaPlot = PCA(n_components=3).fit(trainDataRaw.drop([*targetCols,idCol],axis=1), y=trTarget)
         xPCAplot = pcaPlot.transform(trainDataRaw.drop([*targetCols,idCol],axis=1))
         yPCAplot = trTarget.copy()
-
 
         #%matplotlib qt
 
@@ -517,8 +537,66 @@ if doPCA:
         plt.close()
 
         #%matplotlib inline
-if logRedistr:
-    trTarget = np.log1p(trTarget)
+
+#from sklearn.model_selection import TimeSeriesSplit
+
+#timesplitter used for validation not main training
+#timeSplitter = TimeSeriesSplit(n_splits=numOfSeqs,max_train_size=seqLength,test_size=2)
+
+# xTrain = np.empty((numOfSeqs, 10,8))
+# yTrain = np.empty((numOfSeqs, 10,3))
+# for i,(trainIndex, testIndex) in enumerate(timeSplitter.split(X=trD,y=trTarget)):
+
+#     print('x data shape',trD.to_numpy()[trainIndex].shape, trD.to_numpy()[testIndex].shape)
+#     print('y data shape',trTarget.to_numpy()[trainIndex].shape, trTarget.to_numpy()[testIndex].shape)
+#     xTrain= trD.to_numpy()[trainIndex]
+#     yTrain= trTarget.to_numpy()[trainIndex]
+#     if i>5:break
+
+
+#Random split should be ok, because time windows were added as features
+
+idx = np.arange(0,len(trD))
+np.random.shuffle(idx)
+trainIdx = idx[:int(len(trD)*splitRatio)]
+testIdx = idx[int(len(trD)*splitRatio):]
+xTr =np.asarray(trD)[trainIdx]
+xE= np.asarray(trD)[testIdx]
+yTr = np.asarray(trTarget)[trainIdx]
+yE = np.asarray(trTarget)[testIdx]
+
+
+xTrT = xTr.copy()
+xET = xE.copy()
+teDT = teD.copy()
+
+yTrT = yTr.copy()
+yET = yE.copy()
+
+if doBoxCox:   
+    yTrTBefore = yTrT.copy()
+    powTrans = PowerTransformer(method='box-cox',standardize=False)
+    powTrans.fit(yTrT)
+    yTrT = powTrans.transform(yTrT)
+    yTrTRecovered = powTrans.inverse_transform(yTrT.copy())
+    print('Recovery difference: ', np.sum((yTrTRecovered-yTrTBefore)))
+
+    yET = powTrans.transform(yET)
+      
+
+
+if checkHist:
+    fig, axs = plt.subplots(len(trTarget.columns),1,dpi=300,squeeze=False)
+    for iC, c in enumerate(trTarget.columns):
+        skew = trTarget[c].skew()
+        axs[iC,0].hist(trTarget[c],bins=200)
+        axs[iC,0].set_xlabel(c)
+        axs[iC,0].set_ylabel('Frequency')
+        axs[iC,0].set_title(rf"Skew of {c} is {skew:.4f}")
+    fig.savefig(f'./TargetData_Histogram.png',dpi=300)
+    plt.close()
+
+
 
 
 if plotCorreclations:
@@ -526,36 +604,35 @@ if plotCorreclations:
     corrPlotThreshold = 1 # to check for weak correlations, cont11 and 12 correlate highly
     sb.heatmap(corrs[(corrs < corrPlotThreshold)&(corrs > -corrPlotThreshold)])
     plt.savefig('./AllCorrelations.png',dpi=300)
-    plt.show()
-    plt.close()
-    plt.show()
     plt.close()
     plt.plot(corrs.keys().drop(targetCols),corrs[targetCols].drop(targetCols),'k.')
     plt.ylabel('Correlation with target')
     plt.xticks(rotation=45)
     plt.savefig('./CorrelationsWithTarget.png',dpi=300)
-    plt.show()
     plt.close()
 
-if checkHist:
-    for c in trTarget.columns:
-        plt.hist(trTarget[c],bins=200)
-        plt.xlabel('Target Variable')
-        plt.ylabel('Frequency')
-        plt.savefig(f'./{c}TargetData_Histogram.png',dpi=300)
-        plt.show()
-        plt.close()
+
+
 
 # Normalise
-ssTr = ss().fit(xTr)
+ssTr = ss().fit(xTrT)
 
-xTrT = ssTr.transform(xTr)
-xET = ssTr.transform(xTe)
+xTrT = ssTr.transform(xTrT)
+xET = ssTr.transform(xET)
 teDT = ssTr.transform(teD)
 
-ssTarget = ss().fit(yTr)
-yTrT = ssTarget.transform(yTr)
-yET = ssTarget.transform(yTe)
+ssTarget = ss().fit(yTrT)
+yTrT = ssTarget.transform(yTrT)
+yET = ssTarget.transform(yET)
+
+#Check stats
+if printDataStats:
+    print('\n raw train data stats:')
+    trainDataRaw.drop(idCol,axis=1).info(verbose=1)
+    print(trainDataRaw.drop(idCol,axis=1).describe())
+    tempTrainDf = pd.DataFrame(data=xTrT,columns=trD.columns,index=range(len(xTrT)))
+    tempTrainDf.info(verbose=1)
+    print(tempTrainDf.describe())
 
 #make Dataloaders
 dSetTr = TensorDataset(t.Tensor(xTrT), t.Tensor(yTrT))
@@ -568,20 +645,47 @@ evalDl = dl(dSetE,batch_size=batchSize,shuffle=False)
 
 # Shallow tests
 
+def RMSLE(ypred, yreal): #uses natural log
+    ypred_log = np.log(np.clip(ypred+1,1e-6,1e10))
+    yreal_log=np.log(yreal+1)
+    diffSqr = np.square(ypred_log - yreal_log)
+    rmsleLoss = np.sqrt(np.mean(diffSqr))
+    return rmsleLoss
+
+def predictAndInvTransform(x,model, deepflag=False):
+    if deepflag:
+        yPred = model(x)        
+    else:
+        yPred = model.predict(x)    
+    yPredInv = ssTarget.inverse_transform(yPred)
+    if logRedistr:
+        yPredInv = np.exp(yPredInv)-1
+    if doBoxCox:
+        yPredInv = powTrans.inverse_transform(yPredInv)
+    if np.isnan(yPredInv).sum()>0:
+        yPredInv = np.nan_to_num(yPredInv,copy=True)
+    return yPredInv
+
 def runShallow(model):
     with parallel_backend('threading', n_jobs=-1):
         model.fit(xTrT, yTrT)
-        mseLoss = mse(model.predict(xET), yET) 
-        yTePred = model.predict(xET)        
-        rmsleLoss = np.sqrt(np.mean(np.square(np.log10(yTePred+1)-np.log10(yET+1))))
-        pred = model.predict(teDT)
-        predSub = ssTarget.inverse_transform(pred)
-    return model, mseLoss,  predSub,rmsleLoss
+    #keep out of with statement to avoid kernel crash
+    
+    yTrPredInvTrans = predictAndInvTransform(xTrT, model)
+    yEPredInvTrans = predictAndInvTransform(xET, model)
+
+    mseLoss = mse(yEPredInvTrans, yE)
+    rmsleLossTrain = RMSLE(yTrPredInvTrans, yTr)
+    rmsleLossEval = RMSLE(yEPredInvTrans, yE)
+
+    predSub = predictAndInvTransform(teDT,model)
+
+    return model, mseLoss,  predSub, rmsleLossEval, rmsleLossTrain
 
 def saveSubmission(data,name):
     dfSubmission = pd.DataFrame(data=data,
-                                index=np.arange(0,len(data)*2,2))
-    dfSubmission.reset_index(inplace=True)
+                                index=np.arange(0,len(data),1))
+    dfSubmission.reset_index(inplace=True,drop=False)
     dfSubmission.columns = [idCol,*targetCols]
     dfSubmission[idCol] = testDataRaw[idCol]
     # dfSubmission.rename({'index':'id'},inplace=True)
@@ -610,37 +714,41 @@ if doShallows:
             del paramDict["modelname"]
         #BestTrialParams20210704-145220_Shallow.pkl
         #multi reg seems to crash kernel
-        multiReg = MultiOutputRegressor(xgb.XGBRegressor(**paramDict))
+        multiRegXG = MultiOutputRegressor(xgb.XGBRegressor(**paramDict))
+        print('Fitting XGBoost now')
+        multiRegXG, mseLoss, predSub, rmsleLoss, rmsleLossTrain = runShallow(multiRegXG)
+        print('XGBRegressor MSE: ',mseLoss)
+        print('XGBRegressor RMSLE: ', rmsleLoss, ' Train: ',rmsleLossTrain)
+        saveSubmission(predSub, 'Shallow_XGBoost')
         
-        #multiReg, mseLossXG, predSubXG = runShallow(multiReg)
-        #print('XGBoost RMSE: ',np.sqrt(mseLossXG))
-        
-        bestModDict = {
+        bestForestDict = {
         'modelname':rfr,
         'n_estimators':978,
         'max_features':'log2',
         'max_depth':81
-        } #scores 0.70455
-
+        } 
+        del bestForestDict["modelname"]
         multiRegForest = MultiOutputRegressor(
-            rfr(
-            n_estimators=978,
-            max_features='log2',
-            max_depth=81,
-            verbose=1)
-        )
-        # ranForest = rfr(
-        #     n_estimators=978,
-        #     max_features='log2',
-        #     max_depth=81,
-        #     verbose=1)
-        bay = bayR(verbose=1)
-        svr = SVR(verbose=1)
-        #multiRegForest.fit(xTrT,yTrT)
-        ranForest, mseLoss, predSub, rmsleLoss = runShallow(multiRegForest)
+            rfr(**bestForestDict))
+
+        bestSVR = {
+            'modelname': 'SVR',
+             'C': 35.542238529147916,
+              'kernel': 'poly',
+               'degree': 2,
+                'gamma': 'scale',
+                'coef0': 0.1829941183576717}
+        del bestSVR["modelname"]
+        svrMulti = MultiOutputRegressor(SVR(**bestSVR))
+        ranSVR, mseLoss, predSub, rmsleLoss, rmsleLossTrain = runShallow(svrMulti)
+        print('SVR MSE: ',mseLoss)
+        print('SVR RMSLE: ', rmsleLoss, ' Train: ',rmsleLossTrain)
+        saveSubmission(predSub, 'Shallow_SVR')
+
+        ranForest, mseLoss, predSub, rmsleLoss, rmsleLossTrain = runShallow(multiRegForest)
         print('Forest MSE: ',mseLoss)
-        print('Forest RMSLE: ', rmsleLoss)
-        saveSubmission(predSub, 'Shallow')
+        print('Forest RMSLE: ', rmsleLoss, ' Train: ',rmsleLossTrain)
+        saveSubmission(predSub, 'Shallow_Forest')
         
 
 
@@ -715,8 +823,24 @@ if doLightning:
         if tuneModel:
             lr_finder = trainer.tuner.lr_find(model1,trDl,evalDl)
             fig = lr_finder.plot(suggest=True)
-            fig.show()
+            fig.savefig('LR_finder.png')
             new_lr = lr_finder.suggestion()
             # trainer.tune(model1,trDl)
         else:
             trainer.fit(model1, trDl, evalDl)
+            with t.no_grad():
+                yEPredictedLit = predictAndInvTransform(
+                     t.Tensor(xE),model1, deepflag=True
+                )
+                litFinalEvalLoss = RMSLE(yEPredictedLit, yE)
+
+                yTrPredictedLit = predictAndInvTransform(
+                     t.Tensor(xTrT),model1, deepflag=True
+                )
+                litFinalTrainLoss = RMSLE(yTrPredictedLit, yTr)
+
+                print('\nLighting model final RMSLE Loss:')
+                print(f"Train: {litFinalTrainLoss}, Eval: {litFinalEvalLoss}")
+                yPredLit = predictAndInvTransform(
+                    t.Tensor(teDT),model1, deepflag=True)
+                saveSubmission(yPredLit, 'DeepLit')
