@@ -62,7 +62,7 @@ class LitModel(pl.LightningModule):
             self.weight_decay =  trial.suggest_float("weight_decay", minWD, maxWD)
         else:
             self.lr = bestDict["lr"]
-            self.weight_decay =  weight_decay
+            self.weight_decay =  bestDict["weight_decay"]
         self.model = makeModel(trial, bestDict)
 
     def forward(self, x):
@@ -158,23 +158,22 @@ def makeModel(trial = None, hpDict = None):
 
     return nn.Sequential(*layers)
 
+
+
 def runShallowOpt(model, modelname,idxSel):
     with parallel_backend('threading', n_jobs=-1):
         model.fit(xTrT, yTrT)
-    yTrPred = model.predict(xTrT) 
-    mseLossTrain = mse(yTrPred, yTrT)
-    yEPred = model.predict(xET) 
-    mseLoss = mse(yEPred, yET)
-    yTrPredInvTrans = ssTarget.inverse_transform(yTrPred)
-    yEPredInvTrans = ssTarget.inverse_transform(yEPred)
-    yETInvTrans = ssTarget.inverse_transform(yET)
-    yTrInvTrans = ssTarget.inverse_transform(yTrT)
-    rmsleLossTr = np.sqrt(np.mean(np.square(np.log10(yTrPredInvTrans+1)-np.log10(yTrInvTrans+1))))
-    rmsleLoss = np.sqrt(np.mean(np.square(np.log10(yEPredInvTrans+1)-np.log10(yETInvTrans+1))))
-    pred = model.predict(teDT)
-    predSub = ssTarget.inverse_transform(pred)
-    print(modelname,f' TrainLoss {rmsleLossTr:.3f}, evalLoss: {rmsleLoss:.3f}')
-    return rmsleLossTr, rmsleLoss
+    yTrPredInvTrans = predictAndInvTransform(xTrT, model)
+    yEPredInvTrans = predictAndInvTransform(xET, model)
+
+    mseLoss = mse(yEPredInvTrans, yE)
+    rmsleLossTrain = RMSLE(yTrPredInvTrans, yTr)
+    rmsleLossEval = RMSLE(yEPredInvTrans, yE)
+
+    #predSub = predictAndInvTransform(teDT,model)
+    
+    print(modelname,f' TrainLoss {rmsleLossTrain:.3f}, evalLoss: {rmsleLossEval:.3f}')
+    return rmsleLossTrain, rmsleLossEval
 
 
         
@@ -278,7 +277,8 @@ def trainNN(nnNet,opti,trDl, evalDl,epochs=2, trial=None):
     evalWriterCount=0
     trLosses =[]
     evalLosses = []
-    print('Trial check: ', trial is None)
+    rmsle_eval_Losses = []
+    print('Trial check: trial is None is ', trial is None)
     if 'bestDict' in globals():
         L1val = bestDict["L1val"]
     if trial is not None:
@@ -303,7 +303,6 @@ def trainNN(nnNet,opti,trDl, evalDl,epochs=2, trial=None):
                 writerCount+=1
                 writerTr.add_scalar("lossTr", lossTr.cpu().detach().numpy().item(),writerCount)
             if trial is not None and i >= numBatchesForOptunaTr*batchSize:
-                
                 break
 
 
@@ -324,11 +323,19 @@ def trainNN(nnNet,opti,trDl, evalDl,epochs=2, trial=None):
                             writerEval.add_scalar("lossEval", lossTe.cpu().detach().numpy().item(),evalWriterCount)
                         if trial is not None and iTe >= numBatchesForOptunaTe*batchSize:
                             break
+
+
         trLosses.append(np.mean(epochLossTr))
         evalLosses.append(np.mean(epochLossE))
-
+        with t.no_grad():
+            yEPredictedNN = predictAndInvTransform(
+                     t.Tensor(xET),nnNet.to(t.device('cpu')), deepflag=True
+                )
+            nnNet.to(device)
+            rmsle_eval = RMSLE(yEPredictedNN, yE)
+            rmsle_eval_Losses.append(rmsle_eval)
         if trial is not None:
-            trial.report(np.mean(epochLossE), e)
+            trial.report(rmsle_eval, e)
             if trial.should_prune():
                 raise opt.exceptions.TrialPruned()
         print('\nEpoch ',e,' mean train Loss ',np.mean(epochLossTr))
@@ -344,7 +351,7 @@ def trainNN(nnNet,opti,trDl, evalDl,epochs=2, trial=None):
     # plt.show()
     plt.close()
 
-    return np.mean(epochLossE)
+    return np.mean(rmsle_eval_Losses)
 
 
 def saveBestTrial(study,name):
@@ -369,8 +376,8 @@ uses mean column-wise root mean squared logarithmic error
 """
 
 #Hyperparameters and toggles
-splitRatio = 0.9 #for train eval split
-epochs = 5
+splitRatio = 0.95 #for train eval split
+epochs = 500
 lr = 6e-6
 batchSize = 1024
 addL1Reg = True
@@ -381,12 +388,12 @@ doLearningCurve = False
 logTB = True
 logTB_lightining = True
 
-doShallows =0
+doShallows =1
 doPYNN = 0
-doLightning = 1
+doLightning = 0
 tuneModel = 0
 
-doOptuna = 0 #applies to all methods above
+doOptuna = 1 #applies to all methods above
 
 #optuna Params
 possibleActiFuncs = ["ReLU"] #,"Sigmoid","LeakyReLU","Tanh"
@@ -402,24 +409,24 @@ minWD = 1e-6
 maxWD = 5e-3 #used for lightning
 minLr = 1e-7
 maxLr = 1e-2
-maxTrials = 10
-maxTime = 60000
+maxTrials = 120
+maxTime = 1*60*60
 numBatchesForOptunaTr = 30
 numBatchesForOptunaTe = 20
 
 #optuna shallow params
-possibleShallows = ["rfr","SVR","gradB","xgboost"]#"rfr","SVR","gradB","xgboost"
+possibleShallows = ["rfr"]#"rfr","SVR","gradB","xgboost"
 numShallowSamples = 50000
 
 #Toggles for data augmentation overview
 doPCA = False #looks to be unhelpful
-doBoxCox = 1
+doBoxCox = 1 # works quite well but requires to be fit to Training data
 logRedistr = 0 # might not be the best
-duplicateUnderrepData = True
+duplicateUnderrepData = True #Adds copies of data points to compensate deviation from normal distr
 dupliFac = 3 #how many times the data should be appended
 
 #create extra features from previous data points
-pastPoints = 3 # this number -1 is number of new features per column
+pastPoints = 10 # this number -1 is number of new features per column
 
 plotPCA = False
 checkHist = 1 #Target data looks like double normal distribution
@@ -451,6 +458,9 @@ bestDict ={
     'lr':0.0004610912753128815,
     'L1val':1.395796158400521e-07
     }
+with open(f'{mainDir}/BestTrialParams20210710-180700.pkl','rb') as f:
+            bestDict = pickle.load(f)
+
     
     
 os.chdir(mainDir)
@@ -703,7 +713,7 @@ if doShallows:
         opt.visualization.plot_param_importances(studyShallow)
     else:
         
-        with open(r'E:\KaggleData\Tabular Playground Series - Jan 2021/BestTrialParams20210704-145220_Shallow.pkl','rb') as f:
+        with open(r'E:\KaggleData\Tabular Playground Series - Jul 2021/BestTrialParams20210710-190103_Shallow.pkl','rb') as f:
             paramDict=pickle.load(f)
         paramDict ['tree_method']='gpu_hist'
         paramDict ['predictor']='gpu_predictor' 
@@ -749,6 +759,8 @@ if doShallows:
         print('Forest MSE: ',mseLoss)
         print('Forest RMSLE: ', rmsleLoss, ' Train: ',rmsleLossTrain)
         saveSubmission(predSub, 'Shallow_Forest')
+
+        #TODO take average of predictions
         
 
 
@@ -795,11 +807,25 @@ if doPYNN:
         criterion = nn.MSELoss()
 
         evalLossFromTrain = trainNN(nnNet,opti,trDl, evalDl,epochs = epochs)
-        print('Final Loss val ', evalLossFromTrain, 'RMSE: ',np.sqrt(evalLossFromTrain))
+        print('Final Loss val ', evalLossFromTrain)
 
         nnNet.eval()
-        submissionY = nnNet(t.Tensor(teDT).to(device)).cpu().detach().numpy()
-        saveSubmission(submissionY, 'Deep')
+        with t.no_grad():
+            yEPredictedNN = predictAndInvTransform(
+                     t.Tensor(xET),nnNet.to(t.device('cpu')), deepflag=True
+                )
+            nnFinalEvalLoss = RMSLE(yEPredictedNN, yE)
+
+            yTrPredictedNN = predictAndInvTransform(
+                     t.Tensor(xTrT),nnNet.to(t.device('cpu')), deepflag=True
+                )
+            nnFinalTrainLoss = RMSLE(yTrPredictedNN, yTr)
+
+            yPredNN = predictAndInvTransform(
+                t.Tensor(teDT),nnNet.to(t.device('cpu')), deepflag=True)
+            saveSubmission(yPredNN, 'DeepNN')
+            print('\nNN model final RMSLE Loss:')
+            print(f"Train: {nnFinalTrainLoss}, Eval: {nnFinalEvalLoss}")
        
 
 ## nn with LightningModule
@@ -830,7 +856,7 @@ if doLightning:
             trainer.fit(model1, trDl, evalDl)
             with t.no_grad():
                 yEPredictedLit = predictAndInvTransform(
-                     t.Tensor(xE),model1, deepflag=True
+                     t.Tensor(xET),model1, deepflag=True
                 )
                 litFinalEvalLoss = RMSLE(yEPredictedLit, yE)
 
