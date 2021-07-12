@@ -46,6 +46,7 @@ from optuna.integration import PyTorchLightningPruningCallback
 import pickle
 
 from scipy import stats
+from scipy import optimize as sciOpt
 
 
 #TODO implement optuna for shallows
@@ -367,6 +368,70 @@ def saveBestTrial(study,name):
         pickle.dump(trial.params, f)
 
 
+def RMSLE(ypred, yreal): #uses natural log
+    ypred_log = np.log(np.clip(ypred+1,1e-6,1e10))
+    yreal_log=np.log(yreal+1)
+    diffSqr = np.square(ypred_log - yreal_log)
+    rmsleLoss = np.sqrt(np.mean(diffSqr))
+    return rmsleLoss
+
+def predictAndInvTransform(x,model, deepflag=False):
+    if deepflag:
+        yPred = model(x)        
+    else:
+        yPred = model.predict(x)    
+    yPredInv = ssTarget.inverse_transform(yPred)
+    if logRedistr:
+        yPredInv = np.exp(yPredInv)-1
+    if doBoxCox:
+        yPredInv = powTrans.inverse_transform(yPredInv)
+    if np.isnan(yPredInv).sum()>0:
+        yPredInv = np.nan_to_num(yPredInv,copy=True)
+    return yPredInv
+
+def runShallow(model):
+    with parallel_backend('threading', n_jobs=-1):
+        model.fit(xTrT, yTrT)
+    #keep out of with statement to avoid kernel crash
+    
+    yTrPredInvTrans = predictAndInvTransform(xTrT, model)
+    yEPredInvTrans = predictAndInvTransform(xET, model)
+
+    mseLoss = mse(yEPredInvTrans, yE)
+    rmsleLossTrain = RMSLE(yTrPredInvTrans, yTr)
+    rmsleLossEval = RMSLE(yEPredInvTrans, yE)
+
+    predSub = predictAndInvTransform(teDT,model)
+
+    return model, mseLoss,  predSub, rmsleLossEval, rmsleLossTrain
+
+def saveSubmission(data,name, returnDf = False):
+    dfSubmission = pd.DataFrame(data=data,
+                                index=np.arange(0,len(data),1))
+    dfSubmission.reset_index(inplace=True,drop=False)
+    dfSubmission.columns = [idCol,*targetCols]
+    dfSubmission[idCol] = testDataRaw[idCol]
+    # dfSubmission.rename({'index':'id'},inplace=True)
+    dfSubmission.to_csv(f'logs/{dateTimeNow}_{name}_Submission.csv',index=False)
+    if returnDf:
+        return dfSubmission
+
+
+
+def addPastDataFeatures(df,pastPoints,cols):
+    """
+    Pass cols as list even if single
+    pastPoints is how far into the past to go
+    """
+    for p in range(1,pastPoints):
+        for col in cols:
+            oldColName = col
+            newColName = f"{col}-{p}"
+            df.at[:p-1,newColName] = df.at[0,oldColName]
+            for i in range(p,len(df)):
+                df.at[i,newColName] = df.at[i-p,oldColName]
+    return df
+
 
 #Datadir
 mainDir = r"E:\KaggleData\Tabular Playground Series - Jul 2021"
@@ -393,7 +458,8 @@ doPYNN = 0
 doLightning = 0
 tuneModel = 0
 
-doOptuna = 1 #applies to all methods above
+optimizeWeightedSum = True
+doOptuna = 0 #applies to all methods above
 
 #optuna Params
 possibleActiFuncs = ["ReLU"] #,"Sigmoid","LeakyReLU","Tanh"
@@ -426,11 +492,12 @@ duplicateUnderrepData = True #Adds copies of data points to compensate deviation
 dupliFac = 3 #how many times the data should be appended
 
 #create extra features from previous data points
-pastPoints = 10 # this number -1 is number of new features per column
+pastPoints = 100 # this number -1 is number of new features per column
 
 plotPCA = False
 checkHist = 1 #Target data looks like double normal distribution
-plotCorreclations = 1
+plotCorreclations = 0
+plotTargetsOverTime = 0
 printDataStats = 0
 
 
@@ -500,23 +567,6 @@ if duplicateUnderrepData:
     trTarget = trTarget.append(extraData)
 
 
-# plt.hist(trTarget[trTarget["target_benzene"]<20]["target_benzene"],200)
-
-
-def addPastDataFeatures(df,pastPoints,cols):
-    """
-    Pass cols as list even if single
-    pastPoints is how far into the past to go
-    """
-    for p in range(1,pastPoints):
-        for col in cols:
-            oldColName = col
-            newColName = f"{col}-{p}"
-            df.at[:p-1,newColName] = df.at[0,oldColName]
-            for i in range(p,len(df)):
-                df.at[i,newColName] = df.at[i-p,oldColName]
-    return df
-
 allCols = list(trD.keys())
 trD = addPastDataFeatures(trD, pastPoints, allCols)
 teD = addPastDataFeatures(teD, pastPoints, allCols)
@@ -545,23 +595,6 @@ if doPCA:
         ax.scatter(xPCAplot[idxSel,0], xPCAplot[idxSel,1], xPCAplot[idxSel,2], c = yPCAplot[idxSel])
         plt.show()
         plt.close()
-
-        #%matplotlib inline
-
-#from sklearn.model_selection import TimeSeriesSplit
-
-#timesplitter used for validation not main training
-#timeSplitter = TimeSeriesSplit(n_splits=numOfSeqs,max_train_size=seqLength,test_size=2)
-
-# xTrain = np.empty((numOfSeqs, 10,8))
-# yTrain = np.empty((numOfSeqs, 10,3))
-# for i,(trainIndex, testIndex) in enumerate(timeSplitter.split(X=trD,y=trTarget)):
-
-#     print('x data shape',trD.to_numpy()[trainIndex].shape, trD.to_numpy()[testIndex].shape)
-#     print('y data shape',trTarget.to_numpy()[trainIndex].shape, trTarget.to_numpy()[testIndex].shape)
-#     xTrain= trD.to_numpy()[trainIndex]
-#     yTrain= trTarget.to_numpy()[trainIndex]
-#     if i>5:break
 
 
 #Random split should be ok, because time windows were added as features
@@ -621,6 +654,13 @@ if plotCorreclations:
     plt.savefig('./CorrelationsWithTarget.png',dpi=300)
     plt.close()
 
+if plotTargetsOverTime:
+    plotDf = trainDataRaw[[idCol,*targetCols]].copy()
+    for c in targetCols:
+        plotDf.loc[:,c]/=plotDf[c].max()
+        plotDf.loc[:,c] = plotDf[c].rolling(80).mean()
+    plotDf.plot(x=idCol, y=targetCols,rot=45)
+    plt.savefig('./RollingTargetsOverTime.png',dpi=300)
 
 
 
@@ -655,88 +695,53 @@ evalDl = dl(dSetE,batch_size=batchSize,shuffle=False)
 
 # Shallow tests
 
-def RMSLE(ypred, yreal): #uses natural log
-    ypred_log = np.log(np.clip(ypred+1,1e-6,1e10))
-    yreal_log=np.log(yreal+1)
-    diffSqr = np.square(ypred_log - yreal_log)
-    rmsleLoss = np.sqrt(np.mean(diffSqr))
-    return rmsleLoss
 
-def predictAndInvTransform(x,model, deepflag=False):
-    if deepflag:
-        yPred = model(x)        
-    else:
-        yPred = model.predict(x)    
-    yPredInv = ssTarget.inverse_transform(yPred)
-    if logRedistr:
-        yPredInv = np.exp(yPredInv)-1
-    if doBoxCox:
-        yPredInv = powTrans.inverse_transform(yPredInv)
-    if np.isnan(yPredInv).sum()>0:
-        yPredInv = np.nan_to_num(yPredInv,copy=True)
-    return yPredInv
-
-def runShallow(model):
-    with parallel_backend('threading', n_jobs=-1):
-        model.fit(xTrT, yTrT)
-    #keep out of with statement to avoid kernel crash
-    
-    yTrPredInvTrans = predictAndInvTransform(xTrT, model)
-    yEPredInvTrans = predictAndInvTransform(xET, model)
-
-    mseLoss = mse(yEPredInvTrans, yE)
-    rmsleLossTrain = RMSLE(yTrPredInvTrans, yTr)
-    rmsleLossEval = RMSLE(yEPredInvTrans, yE)
-
-    predSub = predictAndInvTransform(teDT,model)
-
-    return model, mseLoss,  predSub, rmsleLossEval, rmsleLossTrain
-
-def saveSubmission(data,name):
-    dfSubmission = pd.DataFrame(data=data,
-                                index=np.arange(0,len(data),1))
-    dfSubmission.reset_index(inplace=True,drop=False)
-    dfSubmission.columns = [idCol,*targetCols]
-    dfSubmission[idCol] = testDataRaw[idCol]
-    # dfSubmission.rename({'index':'id'},inplace=True)
-    dfSubmission.to_csv(f'logs/{dateTimeNow}_{name}_Submission.csv',index=False)
-
+def weightedSum(weights):
+    yTrPred = (weights[0]*predictAndInvTransform(xTrT,multiRegXG),
+    weights[1]*predictAndInvTransform(xTrT,svrMulti),
+    weights[2]*predictAndInvTransform(xTrT,multiRegForest))
+    yEPred = (weights[0]*predictAndInvTransform(xET,multiRegXG),
+    weights[1]*predictAndInvTransform(xET,svrMulti),
+    weights[2]*predictAndInvTransform(xET,multiRegForest))
+    loss = RMSLE(yTr,yTrPred) + RMSLE(yE,yEPred)
+    return loss
 
 if doShallows:
 
     if doOptuna:
         studyShallow = opt.create_study(direction="minimize")
-        studyShallow.optimize(shallowObjective, maxTrials)
+        studyShallow.optimize(shallowObjective, maxTrials, timeout=maxTime)
         shallowTrial = studyShallow.best_trial
         print(shallowTrial)
         saveBestTrial(studyShallow,'Shallow')        
         opt.visualization.plot_param_importances(studyShallow)
     else:
         
-        with open(r'E:\KaggleData\Tabular Playground Series - Jul 2021/BestTrialParams20210710-190103_Shallow.pkl','rb') as f:
-            paramDict=pickle.load(f)
-        paramDict ['tree_method']='gpu_hist'
-        paramDict ['predictor']='gpu_predictor' 
-        if "lambdaVal" in paramDict.keys():
-            paramDict["lambda"] = paramDict["lambdaVal"]
-            del paramDict["lambdaVal"]
-        if "modelname" in paramDict.keys():
-            del paramDict["modelname"]
+        with open(rf'{mainDir}/BestTrialParams20210710-190103_Shallow.pkl','rb') as f:
+            paramDictXGBoost=pickle.load(f)
+        paramDictXGBoost ['tree_method']='gpu_hist'
+        paramDictXGBoost ['predictor']='gpu_predictor' 
+        if "lambdaVal" in paramDictXGBoost.keys():
+            paramDictXGBoost["lambda"] = paramDictXGBoost["lambdaVal"]
+            del paramDictXGBoost["lambdaVal"]
+        if "modelname" in paramDictXGBoost.keys():
+            del paramDictXGBoost["modelname"]
         #BestTrialParams20210704-145220_Shallow.pkl
-        #multi reg seems to crash kernel
-        multiRegXG = MultiOutputRegressor(xgb.XGBRegressor(**paramDict))
+        multiRegXG = MultiOutputRegressor(xgb.XGBRegressor(**paramDictXGBoost))
         print('Fitting XGBoost now')
         multiRegXG, mseLoss, predSub, rmsleLoss, rmsleLossTrain = runShallow(multiRegXG)
         print('XGBRegressor MSE: ',mseLoss)
         print('XGBRegressor RMSLE: ', rmsleLoss, ' Train: ',rmsleLossTrain)
-        saveSubmission(predSub, 'Shallow_XGBoost')
-        
-        bestForestDict = {
-        'modelname':rfr,
-        'n_estimators':978,
-        'max_features':'log2',
-        'max_depth':81
-        } 
+        xgPrediction = saveSubmission(predSub, 'Shallow_XGBoost', True)
+
+        with open(rf'{mainDir}/BestTrialParams20210711-085005_Shallow.pkl','rb') as f:
+            bestForestDict=pickle.load(f)
+        # bestForestDict = {
+        # 'modelname':rfr,
+        # 'n_estimators':978,
+        # 'max_features':'log2',
+        # 'max_depth':81
+        # } 
         del bestForestDict["modelname"]
         multiRegForest = MultiOutputRegressor(
             rfr(**bestForestDict))
@@ -753,15 +758,30 @@ if doShallows:
         ranSVR, mseLoss, predSub, rmsleLoss, rmsleLossTrain = runShallow(svrMulti)
         print('SVR MSE: ',mseLoss)
         print('SVR RMSLE: ', rmsleLoss, ' Train: ',rmsleLossTrain)
-        saveSubmission(predSub, 'Shallow_SVR')
+        SVRPrediction = saveSubmission(predSub, 'Shallow_SVR', True)
 
         ranForest, mseLoss, predSub, rmsleLoss, rmsleLossTrain = runShallow(multiRegForest)
         print('Forest MSE: ',mseLoss)
         print('Forest RMSLE: ', rmsleLoss, ' Train: ',rmsleLossTrain)
-        saveSubmission(predSub, 'Shallow_Forest')
+        forestPrediction = saveSubmission(predSub, 'Shallow_Forest', True)
 
         #TODO take average of predictions
-        
+        if optimizeWeightedSum:
+            xLims =np.array([[0,1],[0,1],[0,1]])
+            boundsSci = (xLims[0,:],xLims[1,:],xLims[2,:])
+            results = sciOpt.minimize(
+                weightedSum,np.array([0.33,0.33,0.33]),
+                method='Powell', bounds=boundsSci)
+            print(results)
+
+        weightedSumOfPreds = 1/3*(
+            forestPrediction[targetCols].to_numpy( dtype=np.float32)+
+            SVRPrediction[targetCols].to_numpy( dtype=np.float32)+
+            xgPrediction[targetCols].to_numpy( dtype=np.float32)
+        )
+
+        weightedSubmission = saveSubmission(weightedSumOfPreds, 'weightedSumOfPreds', True)
+
 
 
 # nn approach
