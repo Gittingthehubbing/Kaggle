@@ -48,10 +48,21 @@ import pickle
 from scipy import stats
 from scipy import optimize as sciOpt
 
+from pymoo.algorithms.nsga2 import NSGA2
+
+from pymoo.model.problem import FunctionalProblem
 
 #TODO implement optuna for shallows
 #TODO Rebalance data (Might not be needed)
 #TODO increase NN complexity
+
+def pickleLoad(filename):
+    with open(rf'{filename}','rb') as f:
+            return pickle.load(f)
+
+def pickleSave(filename, obj):
+    with open(f'{filename}','wb') as f:
+        pickle.dump(obj, f)
 
 
 class LitModel(pl.LightningModule):
@@ -441,7 +452,9 @@ uses mean column-wise root mean squared logarithmic error
 """
 
 #Hyperparameters and toggles
-splitRatio = 0.95 #for train eval split
+retrainModels = False
+
+splitRatio = 0.65 #for train eval split
 epochs = 500
 lr = 6e-6
 batchSize = 1024
@@ -493,6 +506,7 @@ dupliFac = 3 #how many times the data should be appended
 
 #create extra features from previous data points
 pastPoints = 100 # this number -1 is number of new features per column
+redoPastDataAdding = False
 
 plotPCA = False
 checkHist = 1 #Target data looks like double normal distribution
@@ -568,8 +582,18 @@ if duplicateUnderrepData:
 
 
 allCols = list(trD.keys())
-trD = addPastDataFeatures(trD, pastPoints, allCols)
-teD = addPastDataFeatures(teD, pastPoints, allCols)
+if redoPastDataAdding:
+    trD = addPastDataFeatures(trD, pastPoints, allCols)
+    with open('trainDataAug.pkl','wb') as f:
+        pickle.dump(trD,f) 
+    teD = addPastDataFeatures(teD, pastPoints, allCols)
+    with open('testDataAug.pkl','wb') as f:
+        pickle.dump(teD,f) 
+else:
+    with open('trainDataAug.pkl','rb') as f:
+        trD=pickle.load(f) 
+    with open('testDataAug.pkl','rb') as f:
+        teD=pickle.load(f) 
 
 trD.to_html('trD.html')
         
@@ -727,11 +751,17 @@ if doShallows:
         if "modelname" in paramDictXGBoost.keys():
             del paramDictXGBoost["modelname"]
         #BestTrialParams20210704-145220_Shallow.pkl
-        multiRegXG = MultiOutputRegressor(xgb.XGBRegressor(**paramDictXGBoost))
-        print('Fitting XGBoost now')
-        multiRegXG, mseLoss, predSub, rmsleLoss, rmsleLossTrain = runShallow(multiRegXG)
-        print('XGBRegressor MSE: ',mseLoss)
-        print('XGBRegressor RMSLE: ', rmsleLoss, ' Train: ',rmsleLossTrain)
+
+        if retrainModels:
+            multiRegXG = MultiOutputRegressor(xgb.XGBRegressor(**paramDictXGBoost))
+
+            print('Fitting XGBoost now')
+            multiRegXG, mseLoss, predSub, rmsleLoss, rmsleLossTrain = runShallow(multiRegXG)
+            print('XGBRegressor MSE: ',mseLoss)
+            print('XGBRegressor RMSLE: ', rmsleLoss, ' Train: ',rmsleLossTrain)
+            pickleSave(f"{mainDir}/XGBRegressor_{dateTimeNow}.pkl",multiRegXG)
+        else:
+            ranSVR = pickleLoad('XGBRegressor_20210714-182211.pkl')
         xgPrediction = saveSubmission(predSub, 'Shallow_XGBoost', True)
 
         with open(rf'{mainDir}/BestTrialParams20210711-085005_Shallow.pkl','rb') as f:
@@ -754,24 +784,43 @@ if doShallows:
                 'gamma': 'scale',
                 'coef0': 0.1829941183576717}
         del bestSVR["modelname"]
-        svrMulti = MultiOutputRegressor(SVR(**bestSVR))
-        ranSVR, mseLoss, predSub, rmsleLoss, rmsleLossTrain = runShallow(svrMulti)
-        print('SVR MSE: ',mseLoss)
-        print('SVR RMSLE: ', rmsleLoss, ' Train: ',rmsleLossTrain)
+        if retrainModels:
+            svrMulti = MultiOutputRegressor(SVR(**bestSVR))
+            ranSVR, mseLoss, predSub, rmsleLoss, rmsleLossTrain = runShallow(svrMulti)
+            print('SVR MSE: ',mseLoss)
+            print('SVR RMSLE: ', rmsleLoss, ' Train: ',rmsleLossTrain)
+            pickleSave(f"{mainDir}/ranSVR_{dateTimeNow}.pkl",ranSVR)
+        else:
+            ranSVR = pickleLoad('ranSVR_20210714-182211.pkl')
         SVRPrediction = saveSubmission(predSub, 'Shallow_SVR', True)
 
-        ranForest, mseLoss, predSub, rmsleLoss, rmsleLossTrain = runShallow(multiRegForest)
-        print('Forest MSE: ',mseLoss)
-        print('Forest RMSLE: ', rmsleLoss, ' Train: ',rmsleLossTrain)
+        if retrainModels:
+            ranForest, mseLoss, predSub, rmsleLoss, rmsleLossTrain = runShallow(multiRegForest)
+            print('Forest MSE: ',mseLoss)
+            print('Forest RMSLE: ', rmsleLoss, ' Train: ',rmsleLossTrain)
+            pickleSave(f"{mainDir}/ranForest_{dateTimeNow}.pkl",ranForest)
+        else:
+            ranForest = pickleLoad('ranForest_20210714-182211.pkl')
         forestPrediction = saveSubmission(predSub, 'Shallow_Forest', True)
 
         #TODO take average of predictions
         if optimizeWeightedSum:
             xLims =np.array([[0,1],[0,1],[0,1]])
             boundsSci = (xLims[0,:],xLims[1,:],xLims[2,:])
+
+            objectives = [weightedSum]
+            
+            algo = NSGA2(15)
+            funcProb = FunctionalProblem(
+                        2,objectives,xl=xLims[0,:],xu=xLims[1,:])
+            
+            results = minimize(
+                funcProb,algo,get_termination("n_gen", 30),save_history=True,verbose=True)
+
+
             results = sciOpt.minimize(
                 weightedSum,np.array([0.33,0.33,0.33]),
-                method='Powell', bounds=boundsSci)
+                method='Nelder-Mead', bounds=boundsSci)
             print(results)
 
         weightedSumOfPreds = 1/3*(
