@@ -49,20 +49,22 @@ from scipy import stats
 from scipy import optimize as sciOpt
 
 from pymoo.algorithms.nsga2 import NSGA2
-
+from pymoo.optimize import minimize
 from pymoo.model.problem import FunctionalProblem
+from pymoo.factory import get_termination
+from pymoo.visualization.scatter import Scatter
 
 #TODO implement optuna for shallows
 #TODO Rebalance data (Might not be needed)
 #TODO increase NN complexity
 
-def pickleLoad(filename):
-    with open(rf'{filename}','rb') as f:
-            return pickle.load(f)
-
-def pickleSave(filename, obj):
-    with open(f'{filename}','wb') as f:
-        pickle.dump(obj, f)
+from pymoo.util.display import Display
+class MyDisplay(Display):
+    
+    def _do(self, problem, evaluator, algorithm):
+        super()._do(problem, evaluator, algorithm)
+        self.output.append("X", np.mean(algorithm.pop.get("X")))
+        self.output.append("F", np.mean(algorithm.pop.get("F")))
 
 
 class LitModel(pl.LightningModule):
@@ -134,6 +136,15 @@ class dset(Dataset):
         x = self.xAll[i]
         y = self.xAll[i]
         return (t.Tensor(x,dtype=t.float), t.Tensor(y,dtype=t.float))
+
+
+def pickleLoad(filename):
+    with open(rf'{filename}','rb') as f:
+            return pickle.load(f)
+
+def pickleSave(filename, obj):
+    with open(f'{filename}','wb') as f:
+        pickle.dump(obj, f)
 
 
 def makeModel(trial = None, hpDict = None):
@@ -381,7 +392,7 @@ def saveBestTrial(study,name):
 
 def RMSLE(ypred, yreal): #uses natural log
     ypred_log = np.log(np.clip(ypred+1,1e-6,1e10))
-    yreal_log=np.log(yreal+1)
+    yreal_log=np.log(np.asarray(yreal)+1)
     diffSqr = np.square(ypred_log - yreal_log)
     rmsleLoss = np.sqrt(np.mean(diffSqr))
     return rmsleLoss
@@ -475,12 +486,12 @@ optimizeWeightedSum = True
 doOptuna = 0 #applies to all methods above
 
 #optuna Params
-possibleActiFuncs = ["ReLU"] #,"Sigmoid","LeakyReLU","Tanh"
+possibleActiFuncs = ["ReLU","LeakyReLU","Tanh"] #,"Sigmoid","LeakyReLU","Tanh"
 minLayers = 1
 maxLayers = 10
 minNeurons = 20
 maxNeurons = 1000 #TODO try powers of 2 with int suggest
-minDropOut = 0.
+minDropOut = 0.3
 maxDropOut = 0.7
 l1min = 1e-7 #not used for lightning
 l1max = 1e-2
@@ -595,7 +606,7 @@ else:
     with open('testDataAug.pkl','rb') as f:
         teD=pickle.load(f) 
 
-trD.to_html('trD.html')
+#trD.to_html('trD.html')
         
 
 if doPCA:
@@ -721,12 +732,18 @@ evalDl = dl(dSetE,batch_size=batchSize,shuffle=False)
 
 
 def weightedSum(weights):
-    yTrPred = (weights[0]*predictAndInvTransform(xTrT,multiRegXG),
-    weights[1]*predictAndInvTransform(xTrT,svrMulti),
-    weights[2]*predictAndInvTransform(xTrT,multiRegForest))
-    yEPred = (weights[0]*predictAndInvTransform(xET,multiRegXG),
-    weights[1]*predictAndInvTransform(xET,svrMulti),
-    weights[2]*predictAndInvTransform(xET,multiRegForest))
+    """
+    Takes in weight arrays
+    return loss
+    """
+    yTrPred = (weights[0]*predictAndInvTransform(xTrT,multiRegXG)+
+        weights[1]*predictAndInvTransform(xTrT,ranSVR)+
+        weights[2]*predictAndInvTransform(xTrT,ranForest))
+
+    yEPred = (weights[0]*predictAndInvTransform(xET,multiRegXG)+
+        weights[1]*predictAndInvTransform(xET,ranSVR)+
+        weights[2]*predictAndInvTransform(xET,ranForest))
+
     loss = RMSLE(yTr,yTrPred) + RMSLE(yE,yEPred)
     return loss
 
@@ -761,30 +778,20 @@ if doShallows:
             print('XGBRegressor RMSLE: ', rmsleLoss, ' Train: ',rmsleLossTrain)
             pickleSave(f"{mainDir}/XGBRegressor_{dateTimeNow}.pkl",multiRegXG)
         else:
-            ranSVR = pickleLoad('XGBRegressor_20210714-182211.pkl')
+            multiRegXG = pickleLoad('XGBRegressor_20210714-182211.pkl')
+            predSub = predictAndInvTransform(teDT,multiRegXG)
         xgPrediction = saveSubmission(predSub, 'Shallow_XGBoost', True)
 
-        with open(rf'{mainDir}/BestTrialParams20210711-085005_Shallow.pkl','rb') as f:
-            bestForestDict=pickle.load(f)
-        # bestForestDict = {
-        # 'modelname':rfr,
-        # 'n_estimators':978,
-        # 'max_features':'log2',
-        # 'max_depth':81
-        # } 
-        del bestForestDict["modelname"]
-        multiRegForest = MultiOutputRegressor(
-            rfr(**bestForestDict))
-
-        bestSVR = {
-            'modelname': 'SVR',
-             'C': 35.542238529147916,
-              'kernel': 'poly',
-               'degree': 2,
-                'gamma': 'scale',
-                'coef0': 0.1829941183576717}
-        del bestSVR["modelname"]
         if retrainModels:
+                
+            bestSVR = {
+                'modelname': 'SVR',
+                'C': 35.542238529147916,
+                'kernel': 'poly',
+                'degree': 2,
+                    'gamma': 'scale',
+                    'coef0': 0.1829941183576717}
+            del bestSVR["modelname"]
             svrMulti = MultiOutputRegressor(SVR(**bestSVR))
             ranSVR, mseLoss, predSub, rmsleLoss, rmsleLossTrain = runShallow(svrMulti)
             print('SVR MSE: ',mseLoss)
@@ -792,44 +799,64 @@ if doShallows:
             pickleSave(f"{mainDir}/ranSVR_{dateTimeNow}.pkl",ranSVR)
         else:
             ranSVR = pickleLoad('ranSVR_20210714-182211.pkl')
+            predSub = predictAndInvTransform(teDT,ranSVR)
         SVRPrediction = saveSubmission(predSub, 'Shallow_SVR', True)
 
         if retrainModels:
+                
+            with open(rf'{mainDir}/BestTrialParams20210711-085005_Shallow.pkl','rb') as f:
+                bestForestDict=pickle.load(f)
+            # bestForestDict = {
+            # 'modelname':rfr,
+            # 'n_estimators':978,
+            # 'max_features':'log2',
+            # 'max_depth':81
+            # } 
+            del bestForestDict["modelname"]
+            multiRegForest = MultiOutputRegressor(
+                rfr(**bestForestDict))
+
             ranForest, mseLoss, predSub, rmsleLoss, rmsleLossTrain = runShallow(multiRegForest)
             print('Forest MSE: ',mseLoss)
             print('Forest RMSLE: ', rmsleLoss, ' Train: ',rmsleLossTrain)
             pickleSave(f"{mainDir}/ranForest_{dateTimeNow}.pkl",ranForest)
         else:
             ranForest = pickleLoad('ranForest_20210714-182211.pkl')
+            predSub = predictAndInvTransform(teDT,ranForest)
         forestPrediction = saveSubmission(predSub, 'Shallow_Forest', True)
 
         #TODO take average of predictions
         if optimizeWeightedSum:
+            weightedSumOfPreds = weightedSum(np.array([0.04917891, 0.10612977, 0.87730408]))
             xLims =np.array([[0,1],[0,1],[0,1]])
             boundsSci = (xLims[0,:],xLims[1,:],xLims[2,:])
 
             objectives = [weightedSum]
             
-            algo = NSGA2(15)
+            algo = NSGA2(8, n_offsprings=4)
             funcProb = FunctionalProblem(
-                        2,objectives,xl=xLims[0,:],xu=xLims[1,:])
+                        3,objectives,xl=xLims[:,0],xu=xLims[:,1])
             
             results = minimize(
-                funcProb,algo,get_termination("n_gen", 30),save_history=True,verbose=True)
-
-
-            results = sciOpt.minimize(
-                weightedSum,np.array([0.33,0.33,0.33]),
-                method='Nelder-Mead', bounds=boundsSci)
-            print(results)
-
-        weightedSumOfPreds = 1/3*(
-            forestPrediction[targetCols].to_numpy( dtype=np.float32)+
-            SVRPrediction[targetCols].to_numpy( dtype=np.float32)+
-            xgPrediction[targetCols].to_numpy( dtype=np.float32)
+                funcProb,algo,get_termination("n_gen", 8),
+                save_history=True,verbose=True,display=MyDisplay())
+            print("NSGA2: ",results.X, results.F, results.CV)
+            plot = Scatter(title = "Objective Space")
+            plot.add(results.F)
+            plot.show()
+            # results = sciOpt.minimize(
+            #     weightedSum,np.array([0.04917891, 0.10612977, 0.87730408]),
+            #     method='Nelder-Mead', bounds=boundsSci)
+            # print("Nelder-Mead: ",results)
+        
+        weightedSumOfPreds = (
+            results.X[0]*forestPrediction[targetCols].to_numpy( dtype=np.float32)+
+            results.X[1]*SVRPrediction[targetCols].to_numpy( dtype=np.float32)+
+            results.X[2]*xgPrediction[targetCols].to_numpy( dtype=np.float32)
         )
 
         weightedSubmission = saveSubmission(weightedSumOfPreds, 'weightedSumOfPreds', True)
+
 
 
 
