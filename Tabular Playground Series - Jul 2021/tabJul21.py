@@ -54,11 +54,9 @@ from pymoo.model.problem import FunctionalProblem
 from pymoo.factory import get_termination
 from pymoo.visualization.scatter import Scatter
 
-#TODO implement optuna for shallows
-#TODO Rebalance data (Might not be needed)
-#TODO increase NN complexity
-
 from pymoo.util.display import Display
+
+
 class MyDisplay(Display):
     
     def _do(self, problem, evaluator, algorithm):
@@ -535,34 +533,8 @@ plotCorreclations = 0
 plotTargetsOverTime = 0
 printDataStats = 0
 
-
-#best (BestTrialParams20210703-170634) currently causes overfitting
-bestDict ={
-    'nL':6,
-    'n0':435,
-    'a0':'ReLU',
-    'dropoutL0':0.41252116154797547,
-    'n1':234,
-    'a1':'ReLU',
-    'dropoutL1':0.3705802089015725,
-    'n2':364,
-    'a2':'ReLU',
-    'dropoutL2':0.17624519916649536,
-    'n3':493,
-    'a3':'ReLU',
-    'dropoutL3':0.010860518403366382,
-    'n4':252,
-    'a4':'ReLU',
-    'dropoutL4':0.21194478383187768,
-    'n5':500,
-    'a5':'ReLU',
-    'dropoutL5':0.03323032803874664,
-    'lr':0.0004610912753128815,
-    'L1val':1.395796158400521e-07
-    }
 with open(f'{mainDir}/BestTrialParams20210710-180700.pkl','rb') as f:
             bestDict = pickle.load(f)
-
     
     
 os.chdir(mainDir)
@@ -585,7 +557,8 @@ trainingCols.remove(idCol)
 
 
 resultDicts=[]
-for loopVar in forLoop:
+resultsDf = pd.DataFrame()
+for loopIdx,loopVar in enumerate(forLoop):
     globals()[loopVarName] = loopVar
     finalEvalDictName = f"{loopVarName}_{loopVar}.txt"
     
@@ -593,7 +566,7 @@ for loopVar in forLoop:
     trD = trainDataRaw.drop([*targetCols,idCol],axis=1).copy()
     teD = testDataRaw.copy().drop([idCol],axis=1)
     trTarget = trainDataRaw[targetCols].copy()
-    
+
     if logRedistr:
         trTargetBefore = np.round(trTarget.copy(),10)
         trTarget = np.round(np.log1p(trTarget),10)
@@ -992,12 +965,19 @@ for loopVar in forLoop:
                     saveSubmission(yPredLit, 'DeepLit')
                     modelsEvalScores["NNLightning"]=litFinalEvalLoss
                     modelsEvalScores["NNTrain"]=litFinalTrainLoss
-
+    modelsEvalScores[loopVarName] = loopVar
+    tempDf = pd.DataFrame(modelsEvalScores,index=[loopIdx])
+    resultsDf=resultsDf.append(tempDf)
     if "modelsEvalScores" in locals():
         with open(f"{finalEvalDictName}.txt","w+") as f:
             for k in modelsEvalScores.keys():
                 f.write(f"{k}: {modelsEvalScores[k]},\n")
                 
     res = modelsEvalScores
-    resultDicts.append(res)
-    pickleSave('resultDicts.pkl',resultDicts)
+    resultDicts.append([loopVar,res])
+    pickleSave(f'{loopVarName}_resultDicts.pkl',resultDicts)    
+    pickleSave(f'{loopVarName}_resultsDf.pkl',resultsDf)
+
+
+resultsDf.plot(x=loopVarName,y=i.keys()).legend(bbox_to_anchor=(1,1))
+plt.ylabel("RMSLE")
