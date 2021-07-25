@@ -67,7 +67,7 @@ class MyDisplay(Display):
 
 class LitModel(pl.LightningModule):
 
-    def __init__(self, x, trial=None):
+    def __init__(self, x, trial=None,bestDictLightning=None):
         super().__init__()
         if trial is not None:
             self.lr = trial.suggest_float("lr", minLr, maxLr)
@@ -89,7 +89,7 @@ class LitModel(pl.LightningModule):
 
     def configure_optimizers(self):
        return t.optim.Adam(self.parameters(), 
-                           lr=(self.lr or self.learning_rate))
+                           lr=(self.lr or self.learning_rate),weight_decay=self.weight_decay)
 
     def validation_step(self, batch, batch_idx):
         x, y = batch
@@ -155,7 +155,7 @@ def makeModel(trial = None, hpDict = None):
         nl = trial.suggest_int("nL",minLayers,maxLayers)
         
         for i in range(nl):
-            outFeat = trial.suggest_int(f"n{i}",minNeurons,maxNeurons)
+            outFeat = 2**trial.suggest_int(f"n{i}",minNeurons,maxNeurons)
             layers.append(nn.Linear(inFeat, outFeat))
             actiLayer = trial.suggest_categorical(f"a{i}",possibleActiFuncs)
             layers.append(getattr(nn, actiLayer)())
@@ -257,7 +257,7 @@ def shallowObjective(trial):
             "max_depth" : trial.suggest_int("max_depth",1,20),
             "n_estimators" : trial.suggest_int("n_estimators",10,10000),
             "min_child_weight" : trial.suggest_int("min_child_weight",1,500),
-            "reg_lambda_xgboost":trial.suggest_float("reg_lambda_xgboost",1e-7,1e0,log=True),
+            "reg_lambda":trial.suggest_float("reg_lambda",1e-7,1e0,log=True),
             'tree_method':'gpu_hist',
             'predictor': 'gpu_predictor'
             }
@@ -265,8 +265,9 @@ def shallowObjective(trial):
         model = xgb.XGBRegressor(**paramDict)
         multiRegModel = MultiOutputRegressor(model)
         trainLoss, evalLoss = runShallowOpt(multiRegModel, modelname,idxSel)
-        overfitLoss = t.sqrt((evalLoss - trainLoss)**2)
-    return overfitLoss
+    overfitLoss = np.sqrt((evalLoss - trainLoss)**2)
+    totalLoss = evalLoss + overfitLoss*0.1
+    return totalLoss
 
 
 def litObjective(trial):
@@ -278,7 +279,8 @@ def litObjective(trial):
         callbacks=[PyTorchLightningPruningCallback(
             trial, monitor="val_loss")])
     hyperP = trial.params
-    trainer.logger.log_hyperparams(hyperP)
+    if trainer.logger is not None:
+        trainer.logger.log_hyperparams(hyperP)
     trainer.fit(model,train_dataloader=trDl,val_dataloaders=evalDl)
     return trainer.callback_metrics["val_loss"].item()
     
@@ -482,15 +484,16 @@ uses mean column-wise root mean squared logarithmic error
 """
 
 #Hyperparameters and toggles
-loopVarName = "ccp_alpha_RFR"
-doLoop = True
-extraText = "_SmallerRange_12_PastPoints_No_PCA"
-forLoop = np.linspace(1e-4,1e-2,11)
+loopVarName = "weight_decay"
+overwriteNNDictProperty = True
+doLoop = False
+extraText = "Lightning_12_PastPoints_No_PCA"
+forLoop = np.logspace(-7,0,8)
 retrainModels = True
 saveTrainedModels =False
 
 splitRatio = 0.75 #for train eval split
-epochs = 500
+epochs = 200
 lr = 6e-6
 batchSize = 1024
 addL1Reg = True
@@ -503,33 +506,34 @@ logTB_lightining = False
 
 doShallows =1
 shallowToDo = {
-    "rfr":1,
-    "SVR":0,
+    "rfr":0,
+    "SVR":1,
     "xgboost":0,
 }
 doPYNN = 0
-doLightning = 0
+doLightning = 1
 tuneModel = 0
 
 #Testing extra hyperparams
-ccp_alpha_RFR = 1e-5
-reg_lambda_xgboost = 1e-5
+ccp_alpha_RFR = 3e-3
+reg_lambda = 1e-5 #reg_lambda for XGBoost
+reg_alpha  = 1e-4
 
 optimizeWeightedSum = False
-doOptuna = 0 #applies to all methods above
+doOptuna = 1 #applies to all methods above
 
 #optuna Params
 possibleActiFuncs = ["ReLU","LeakyReLU","Tanh"] #,"Sigmoid","LeakyReLU","Tanh"
 minLayers = 1
 maxLayers = 10
-minNeurons = 20
-maxNeurons = 1000 #TODO try powers of 2 with int suggest
-minDropOut = 0.3
-maxDropOut = 0.7
+minNeurons = 4
+maxNeurons = 13 # 2**This_Number
+minDropOut = 0.2
+maxDropOut = 0.6
 l1min = 1e-7 #not used for lightning
 l1max = 1e-2
-minWD = 1e-6
-maxWD = 5e-3 #used for lightning
+minWD = 1e-3
+maxWD = 1e-2 #used for lightning and NN
 minLr = 1e-7
 maxLr = 1e-2
 maxTrials = 120
@@ -538,7 +542,7 @@ numBatchesForOptunaTr = 30
 numBatchesForOptunaTe = 20
 
 #optuna shallow params
-possibleShallows = ["rfr"]#"rfr","SVR","gradB","xgboost"
+possibleShallows = ["SVR"]#"rfr","SVR","gradB","xgboost"
 numShallowSamples = 50000
 
 #Toggles for data augmentation overview
@@ -551,7 +555,7 @@ dupliFac = 0 #how many times the data should be appended
 
 #create extra features from previous data points
 pastPoints = 12 # this number -1 is number of new features per column
-redoPastDataAdding = True
+redoPastDataAdding = False
 
 plotPCA = False
 checkHist = 0 #Target data looks like double normal distribution
@@ -570,6 +574,8 @@ if logTB and doPYNN:
     writerEval = SummaryWriter("logs/"+dateTimeNow+"EvalLosses")
 if logTB_lightining and doLightning:
     tb_logger = pl.loggers.TensorBoardLogger('lightning_logs/')
+else:
+    tb_logger = None
 
 trainDataRaw = pd.read_csv("train.csv")
 testDataRaw = pd.read_csv("test.csv")
@@ -598,7 +604,7 @@ for loopIdx,loopVar in enumerate(forLoop):
         trTargetBefore = np.round(trTarget.copy(),10)
         trTarget = np.round(np.log1p(trTarget),10)
         trTargetRecovered = np.round(np.exp(trTarget)-1,10)
-        print('Recovery difference: ', np.sum((trTargetRecovered-trTargetBefore)))
+        #print('Recovery difference: ', np.sum((trTargetRecovered-trTargetBefore)))
 
 
     if duplicateUnderrepData and dupliFac>0:
@@ -674,7 +680,7 @@ for loopIdx,loopVar in enumerate(forLoop):
         powTrans.fit(yTrT)
         yTrT = powTrans.transform(yTrT)
         yTrTRecovered = powTrans.inverse_transform(yTrT.copy())
-        print('Recovery difference: ', np.sum((yTrTRecovered-yTrTBefore)))
+        print('BoxCox Recovery difference: ', np.sum((yTrTRecovered-yTrTBefore)))
 
         yET = powTrans.transform(yET)        
 
@@ -754,7 +760,8 @@ for loopIdx,loopVar in enumerate(forLoop):
             shallowTrial = studyShallow.best_trial
             print(shallowTrial)
             saveBestTrial(studyShallow,'Shallow')        
-            opt.visualization.plot_param_importances(studyShallow)
+            fig = opt.visualization.plot_param_importances(studyShallow)
+            fig.write_html("plot_param_importances_Shallow.html")
         else:
             
             
@@ -764,7 +771,8 @@ for loopIdx,loopVar in enumerate(forLoop):
                         paramDictXGBoost=pickle.load(f)
                     paramDictXGBoost ['tree_method']='gpu_hist'
                     paramDictXGBoost ['predictor']='gpu_predictor' 
-                    paramDictXGBoost ['reg_lambda_xgboost']=reg_lambda_xgboost 
+                    paramDictXGBoost ['reg_lambda']=reg_lambda 
+                    paramDictXGBoost ['reg_alpha']=reg_alpha 
                     if "lambdaVal" in paramDictXGBoost.keys():
                         paramDictXGBoost["lambda"] = paramDictXGBoost["lambdaVal"]
                         del paramDictXGBoost["lambdaVal"]
@@ -772,8 +780,10 @@ for loopIdx,loopVar in enumerate(forLoop):
                         del paramDictXGBoost["modelname"]
                     #BestTrialParams20210704-145220_Shallow.pkl
                     multiRegXG = MultiOutputRegressor(xgb.XGBRegressor(**paramDictXGBoost))
+                    multiRegXGParams = multiRegXG.get_params()
+                    #print("multiRegXGParams ",multiRegXGParams)
 
-                    print('Fitting XGBoost now')
+                    print('\nFitting XGBoost now')
                     multiRegXG, mseLoss, predSub, rmsleLoss, rmsleLossTrain = runShallow(multiRegXG)
                     print('XGBRegressor MSE: ',mseLoss)
                     print('XGBRegressor RMSLE: ', rmsleLoss, ' Train: ',rmsleLossTrain)
@@ -889,6 +899,8 @@ for loopIdx,loopVar in enumerate(forLoop):
             with open(f'./BestTrialParams{dateTimeNow}.pkl','wb') as f:
                 pickle.dump(trial.params, f)
             opt.visualization.plot_param_importances(study)
+            fig = opt.visualization.plot_param_importances(studyShallow)
+            fig.write_html("plot_param_importances_NN.html")
         elif doLearningCurve:
             indsTr =np.arange(len(dSetTr))
             np.random.shuffle(indsTr)
@@ -902,10 +914,12 @@ for loopIdx,loopVar in enumerate(forLoop):
             print('Final Loss val ', evalLossFromTrain)
 
         else:
+            if overwriteNNDictProperty:
+                bestDictNN[loopVarName] = loopVar
             nnNet = makeModel(hpDict=bestDictNN).to(device)
             opti = t.optim.Adam(
                 nnNet.parameters(), lr = bestDictNN["lr"],
-                weight_decay=1e-3)
+                weight_decay=bestDictNN["weight_decay"])
             criterion = nn.MSELoss()
 
             evalLossFromTrain = trainNN(nnNet,opti,trDl, evalDl,epochs = epochs)
@@ -943,13 +957,18 @@ for loopIdx,loopVar in enumerate(forLoop):
             saveBestTrial(study, 'Lightning')
             #Visualize parameter importances.
             opt.visualization.plot_param_importances(study)
+            fig = opt.visualization.plot_param_importances(studyShallow)
+            fig.write_html("plot_param_importances_NN_Lightning.html")
         else:
             with open('BestTrialParams20210704-125835_Lightning.pkl','rb') as f:
                 bestDictLightning = pickle.load(f)
             
+            if overwriteNNDictProperty:
+                bestDictLightning[loopVarName] = loopVar
+
             trainer = pl.Trainer(
                 gpus=1,max_epochs=epochs,stochastic_weight_avg=True, logger=tb_logger)
-            model1 = LitModel(t.Tensor(xTrT[:50]).float())
+            model1 = LitModel(t.Tensor(xTrT[:50]).float(),bestDictLightning=bestDictLightning)
             if tuneModel:
                 lr_finder = trainer.tuner.lr_find(model1,trDl,evalDl)
                 fig = lr_finder.plot(suggest=True)
@@ -981,6 +1000,8 @@ for loopIdx,loopVar in enumerate(forLoop):
     resultsDf=resultsDf.append(tempDf)                
     res = modelsEvalScores
     resultDicts.append([loopVar,res])
+    if not doLoop:
+        extraText +="_No_Loop"
     pickleSave(f'{loopVarName}{extraText}_resultDicts.pkl',resultDicts)    
     pickleSave(f'{loopVarName}{extraText}_resultsDf.pkl',resultsDf)
     if not doLoop:
@@ -993,8 +1014,8 @@ if doLoop:
     try:
         if resultsDf.loc[0,loopVarName]/resultsDf.loc[-1,loopVarName] >100:
             plt.xscale("log")
-    except:
-        print("Rescale failed")
+    except Exception as e:
+        print(e,"\nRescale failed")
     plt.tight_layout()
     plt.savefig(f'{loopVarName}{extraText}_results.png',dpi=300)
 else:
