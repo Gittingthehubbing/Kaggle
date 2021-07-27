@@ -155,7 +155,7 @@ def makeModel(trial = None, hpDict = None):
         nl = trial.suggest_int("nL",minLayers,maxLayers)
         
         for i in range(nl):
-            outFeat = 2**trial.suggest_int(f"n{i}",minNeurons,maxNeurons)
+            outFeat = trial.suggest_int(f"n{i}",minNeurons,maxNeurons)
             layers.append(nn.Linear(inFeat, outFeat))
             actiLayer = trial.suggest_categorical(f"a{i}",possibleActiFuncs)
             layers.append(getattr(nn, actiLayer)())
@@ -274,10 +274,11 @@ def litObjective(trial):
     
     model = LitModel(xTrT[:1000],trial=trial)
     trainer= pl.Trainer(
-        limit_val_batches = 0.2,
+        limit_val_batches = 0.5,
         logger = tb_logger, max_epochs=epochs, gpus=1,
         callbacks=[PyTorchLightningPruningCallback(
-            trial, monitor="val_loss")])
+            trial, monitor="val_loss")],
+            checkpoint_callback=False)
     hyperP = trial.params
     if trainer.logger is not None:
         trainer.logger.log_hyperparams(hyperP)
@@ -449,6 +450,8 @@ def addPastDataFeatures(df,pastPoints,cols):
     Pass cols as list even if single
     pastPoints is how far into the past to go
     """
+    df_old_index = df.index
+    df = df.reset_index(drop=True)
     if pastPoints>2:
         for p in range(1,pastPoints):
             for col in cols:
@@ -457,6 +460,7 @@ def addPastDataFeatures(df,pastPoints,cols):
                 df.at[:p-1,newColName] = df.at[0,oldColName]
                 for i in range(p,len(df)):
                     df.at[i,newColName] = df.at[i-p,oldColName]
+    df.index = df_old_index
     return df
 
 
@@ -484,16 +488,18 @@ uses mean column-wise root mean squared logarithmic error
 """
 
 #Hyperparameters and toggles
-loopVarName = "weight_decay"
-overwriteNNDictProperty = True
+loopVarName = "_"
+overwriteNNDictProperty = False
 doLoop = False
 extraText = "Lightning_12_PastPoints_No_PCA"
 forLoop = np.logspace(-7,0,8)
 retrainModels = True
 saveTrainedModels =False
 
+evaluationSplit = 0.9 # to check that hyperparameters are not overfitted to crossval set
+shuffleTrainTestSplit = False
 splitRatio = 0.75 #for train eval split
-epochs = 200
+epochs = 400
 lr = 6e-6
 batchSize = 1024
 addL1Reg = True
@@ -504,11 +510,11 @@ doLearningCurve = False
 logTB = False
 logTB_lightining = False
 
-doShallows =1
+doShallows =0
 shallowToDo = {
     "rfr":0,
-    "SVR":1,
-    "xgboost":0,
+    "SVR":0,
+    "xgboost":1,
 }
 doPYNN = 0
 doLightning = 1
@@ -520,14 +526,16 @@ reg_lambda = 1e-5 #reg_lambda for XGBoost
 reg_alpha  = 1e-4
 
 optimizeWeightedSum = False
-doOptuna = 1 #applies to all methods above
+doOptuna = 0 #applies to all methods above
+loadStudy = True
+dateTimeOfStudy = "20210726-125126" #to continue previous Study
 
 #optuna Params
 possibleActiFuncs = ["ReLU","LeakyReLU","Tanh"] #,"Sigmoid","LeakyReLU","Tanh"
 minLayers = 1
 maxLayers = 10
-minNeurons = 4
-maxNeurons = 13 # 2**This_Number
+minNeurons = 50
+maxNeurons = 1500 # 2**This_Number
 minDropOut = 0.2
 maxDropOut = 0.6
 l1min = 1e-7 #not used for lightning
@@ -536,13 +544,13 @@ minWD = 1e-3
 maxWD = 1e-2 #used for lightning and NN
 minLr = 1e-7
 maxLr = 1e-2
-maxTrials = 120
+maxTrials = 100
 maxTime = 1*60*60
 numBatchesForOptunaTr = 30
 numBatchesForOptunaTe = 20
 
 #optuna shallow params
-possibleShallows = ["SVR"]#"rfr","SVR","gradB","xgboost"
+possibleShallows = ["xgboost"]#"rfr","SVR","gradB","xgboost"
 numShallowSamples = 50000
 
 #Toggles for data augmentation overview
@@ -555,7 +563,7 @@ dupliFac = 0 #how many times the data should be appended
 
 #create extra features from previous data points
 pastPoints = 12 # this number -1 is number of new features per column
-redoPastDataAdding = False
+redoPastDataAdding = True
 
 plotPCA = False
 checkHist = 0 #Target data looks like double normal distribution
@@ -563,7 +571,7 @@ plotCorreclations = 0
 plotTargetsOverTime = 0
 printDataStats = 0
 
-with open(f'{mainDir}/BestTrialParams20210710-180700.pkl','rb') as f:
+with open(f'{mainDir}/BestTrialParams20210726-064703.pkl','rb') as f:
             bestDictNN = pickle.load(f)
     
     
@@ -587,6 +595,15 @@ for col in targetCols.copy():
     trainingCols.remove(col)
 trainingCols.remove(idCol)
 
+evalIdx = int(len(trainDataRaw)*evaluationSplit)
+evaluationData = trainDataRaw.iloc[evalIdx:]
+evalData = evaluationData.drop([*targetCols,idCol],axis=1).copy()
+evalTarget = evaluationData[targetCols].copy()
+
+trD = trainDataRaw.iloc[:evalIdx].drop([*targetCols,idCol],axis=1).copy()
+teD = testDataRaw.copy().drop([idCol],axis=1)
+trTarget = trainDataRaw.iloc[:evalIdx][targetCols].copy()
+
 
 resultDicts=[]
 resultsDf = pd.DataFrame()
@@ -596,9 +613,6 @@ for loopIdx,loopVar in enumerate(forLoop):
         print(f"Changing {loopVarName} to {loopVar}")
         globals()[loopVarName] = loopVar        
 
-    trD = trainDataRaw.drop([*targetCols,idCol],axis=1).copy()
-    teD = testDataRaw.copy().drop([idCol],axis=1)
-    trTarget = trainDataRaw[targetCols].copy()
 
     if logRedistr:
         trTargetBefore = np.round(trTarget.copy(),10)
@@ -623,11 +637,16 @@ for loopIdx,loopVar in enumerate(forLoop):
         teD = addPastDataFeatures(teD, pastPoints, allCols)
         with open('testDataAug.pkl','wb') as f:
             pickle.dump(teD,f) 
+        evalData = addPastDataFeatures(evalData, pastPoints, allCols)
+        with open('evalDataAug.pkl','wb') as f:
+            pickle.dump(evalData,f) 
     else:
         with open('trainDataAug.pkl','rb') as f:
             trD=pickle.load(f) 
         with open('testDataAug.pkl','rb') as f:
             teD=pickle.load(f) 
+        with open('evalDataAug.pkl','rb') as f:
+            evalData=pickle.load(f) 
 
     #trD.to_html('trD.html')
             
@@ -636,7 +655,8 @@ for loopIdx,loopVar in enumerate(forLoop):
         pca = PCA(n_components=pcaComps).fit(trD)
         trD = pca.transform(trD)
         teD = pca.transform(teD)
-        print(trD.shape,teD.shape)
+        evalData = pca.transform(evalData)
+        print("PCA shapes",trD.shape,teD.shape,evalData.shape)
         if plotPCA:
             pcaPlot = PCA(n_components=3).fit(trainDataRaw.drop([*targetCols,idCol],axis=1), y=trTarget)
             xPCAplot = pcaPlot.transform(trainDataRaw.drop([*targetCols,idCol],axis=1))
@@ -658,7 +678,9 @@ for loopIdx,loopVar in enumerate(forLoop):
     #Random split should be ok, because time windows were added as features
 
     idx = np.arange(0,len(trD))
-    np.random.shuffle(idx)
+
+    if shuffleTrainTestSplit:
+        np.random.shuffle(idx)
     trainIdx = idx[:int(len(trD)*splitRatio)]
     testIdx = idx[int(len(trD)*splitRatio):]
     xTr =np.asarray(trD)[trainIdx]
@@ -670,6 +692,7 @@ for loopIdx,loopVar in enumerate(forLoop):
     xTrT = xTr.copy()
     xET = xE.copy()
     teDT = teD.copy()
+    evalData_transformed = evalData.copy()
 
     yTrT = yTr.copy()
     yET = yE.copy()
@@ -724,7 +747,8 @@ for loopIdx,loopVar in enumerate(forLoop):
 
     xTrT = ssTr.transform(xTrT)
     xET = ssTr.transform(xET)
-    teDT = ssTr.transform(teD)
+    teDT = ssTr.transform(teDT)
+    evalData_transformed = ssTr.transform(evalData_transformed)
 
     ssTarget = ss().fit(yTrT)
     yTrT = ssTarget.transform(yTrT)
@@ -755,13 +779,18 @@ for loopIdx,loopVar in enumerate(forLoop):
     if doShallows:
 
         if doOptuna:
-            studyShallow = opt.create_study(direction="minimize")
+            
+            if loadStudy:
+                studyShallow = pickleLoad(f"ShallowStudy_{dateTimeOfStudy}.pkl")
+            else:
+                studyShallow = opt.create_study(direction="minimize", study_name=f"ShallowStudy_{dateTimeNow}")
             studyShallow.optimize(shallowObjective, maxTrials, timeout=maxTime)
             shallowTrial = studyShallow.best_trial
             print(shallowTrial)
             saveBestTrial(studyShallow,'Shallow')        
             fig = opt.visualization.plot_param_importances(studyShallow)
             fig.write_html("plot_param_importances_Shallow.html")
+            pickleSave(f"ShallowStudy_{dateTimeNow}.pkl",study)
         else:
             
             
@@ -785,14 +814,19 @@ for loopIdx,loopVar in enumerate(forLoop):
 
                     print('\nFitting XGBoost now')
                     multiRegXG, mseLoss, predSub, rmsleLoss, rmsleLossTrain = runShallow(multiRegXG)
+                    pred_evaluation = predictAndInvTransform(evalData_transformed,multiRegXG)
+                    rmsleLoss_final_evaluation = RMSLE(pred_evaluation, evalTarget)
                     print('XGBRegressor MSE: ',mseLoss)
-                    print('XGBRegressor RMSLE: ', rmsleLoss, ' Train: ',rmsleLossTrain)
+                    print('XGBRegressor RMSLE: ', rmsleLoss, ' Train: ',rmsleLossTrain, " Final Eval: ",rmsleLoss_final_evaluation)
                     if saveTrainedModels:
                         pickleSave(f"{mainDir}/XGBRegressor_{dateTimeNow}.pkl",multiRegXG)
                 else:
                     multiRegXG = pickleLoad('XGBRegressor_20210714-182211.pkl')
                     multiRegXG, mseLoss, predSub, rmsleLoss, rmsleLossTrain = runShallow(multiRegXG,doFit=False)
+                    pred_evaluation = predictAndInvTransform(evalData_transformed,multiRegXG)
+                    rmsleLoss_final_evaluation = RMSLE(pred_evaluation, evalTarget)
                     predSub = predictAndInvTransform(teDT,multiRegXG)
+                    
                 xgPrediction = saveSubmission(predSub, 'Shallow_XGBoost', True)
                 
                 modelsEvalScores["multiRegXG_Eval"]=rmsleLoss            
@@ -811,6 +845,8 @@ for loopIdx,loopVar in enumerate(forLoop):
                     del bestSVR["modelname"]
                     svrMulti = MultiOutputRegressor(SVR(**bestSVR))
                     ranSVR, mseLoss, predSub, rmsleLoss, rmsleLossTrain = runShallow(svrMulti)
+                    pred_evaluation = predictAndInvTransform(evalData_transformed,ranSVR)
+                    rmsleLoss_final_evaluation = RMSLE(pred_evaluation, evalTarget)
                     print('SVR MSE: ',mseLoss)
                     print('SVR RMSLE: ', rmsleLoss, ' Train: ',rmsleLossTrain)
                     if saveTrainedModels:
@@ -818,6 +854,8 @@ for loopIdx,loopVar in enumerate(forLoop):
                 else:
                     ranSVR = pickleLoad('ranSVR_20210714-182211.pkl')
                     ranSVR, mseLoss, predSub, rmsleLoss, rmsleLossTrain = runShallow(ranSVR,False)
+                    pred_evaluation = predictAndInvTransform(evalData_transformed,ranSVR)
+                    rmsleLoss_final_evaluation = RMSLE(pred_evaluation, evalTarget)
                     predSub = predictAndInvTransform(teDT,ranSVR)
                 SVRPrediction = saveSubmission(predSub, 'Shallow_SVR', True)
                 modelsEvalScores["ranSVR_Eval"]=rmsleLoss            
@@ -834,6 +872,8 @@ for loopIdx,loopVar in enumerate(forLoop):
                         rfr(**bestForestDict))
 
                     ranForest, mseLoss, predSub, rmsleLoss, rmsleLossTrain = runShallow(multiRegForest)
+                    pred_evaluation = predictAndInvTransform(evalData_transformed,ranForest)
+                    rmsleLoss_final_evaluation = RMSLE(pred_evaluation, evalTarget)
                     print('Forest MSE: ',mseLoss)
                     print('Forest RMSLE: ', rmsleLoss, ' Train: ',rmsleLossTrain)
                     if saveTrainedModels:
@@ -841,6 +881,8 @@ for loopIdx,loopVar in enumerate(forLoop):
                 else:
                     ranForest = pickleLoad('ranForest_20210714-182211.pkl')
                     ranForest, mseLoss, predSub, rmsleLoss, rmsleLossTrain = runShallow(ranForest,False)
+                    pred_evaluation = predictAndInvTransform(evalData_transformed,ranForest)
+                    rmsleLoss_final_evaluation = RMSLE(pred_evaluation, evalTarget)
                     predSub = predictAndInvTransform(teDT,ranForest)
                 forestPrediction = saveSubmission(predSub, 'Shallow_Forest', True)        
                 modelsEvalScores["ranForest_Eval"]=rmsleLoss
@@ -886,8 +928,13 @@ for loopIdx,loopVar in enumerate(forLoop):
         
 
         if doOptuna:
-            criterion = nn.MSELoss()
-            study = opt.create_study(direction="minimize")
+            
+            if loadStudy:
+                study = pickleLoad(f"NN_Study_{dateTimeOfStudy}.pkl")
+            else:
+                study = opt.create_study(direction="minimize", study_name=f"NN_Study_{dateTimeNow}")
+                
+            criterion = nn.MSELoss()            
             study.optimize(objective, n_trials=maxTrials, timeout=maxTime)
             trial = study.best_trial
             print('\nBest Study Parameters:')
@@ -899,8 +946,9 @@ for loopIdx,loopVar in enumerate(forLoop):
             with open(f'./BestTrialParams{dateTimeNow}.pkl','wb') as f:
                 pickle.dump(trial.params, f)
             opt.visualization.plot_param_importances(study)
-            fig = opt.visualization.plot_param_importances(studyShallow)
+            fig = opt.visualization.plot_param_importances(study)
             fig.write_html("plot_param_importances_NN.html")
+            pickleSave(f"NN_Study_{dateTimeNow}.pkl",study)
         elif doLearningCurve:
             indsTr =np.arange(len(dSetTr))
             np.random.shuffle(indsTr)
@@ -936,12 +984,14 @@ for loopIdx,loopVar in enumerate(forLoop):
                         t.Tensor(xTrT),nnNet.to(t.device('cpu')), deepflag=True
                     )
                 nnFinalTrainLoss = RMSLE(yTrPredictedNN, yTr)
+                pred_evaluation = predictAndInvTransform(t.Tensor(evalData_transformed),nnNet.to(t.device('cpu')),deepflag=True)
+                rmsleLoss_final_evaluation = RMSLE(pred_evaluation, evalTarget)
 
                 yPredNN = predictAndInvTransform(
                     t.Tensor(teDT),nnNet.to(t.device('cpu')), deepflag=True)
                 saveSubmission(yPredNN, 'DeepNN')
                 print('\nNN model final RMSLE Loss:')
-                print(f"Train: {nnFinalTrainLoss}, Eval: {nnFinalEvalLoss}")
+                print(f"Train: {nnFinalTrainLoss}, Eval: {nnFinalEvalLoss}, Final Evaluation: {rmsleLoss_final_evaluation}")
             modelsEvalScores["NN_Eval"]=nnFinalEvalLoss
             modelsEvalScores["NN_Train"]=nnFinalTrainLoss
         
@@ -951,50 +1001,59 @@ for loopIdx,loopVar in enumerate(forLoop):
         
         if doOptuna:
             
+            if loadStudy:
+                study = pickleLoad(f"NN_Lightning_Study_{dateTimeOfStudy}.pkl")
+            else:
+                study = opt.create_study(direction="minimize", study_name=f"NN_Lightning_Study_{dateTimeNow}")
+                
             bestDictLightning = None
-            study = opt.create_study(direction="minimize", pruner=opt.pruners.MedianPruner())
-            study.optimize(litObjective,n_trials=maxTrials, timeout=maxTime)
+            study = opt.create_study(direction="minimize", pruner=opt.pruners.SuccessiveHalvingPruner())
+            study.optimize(litObjective,n_trials=maxTrials, timeout=maxTime)            
             saveBestTrial(study, 'Lightning')
             #Visualize parameter importances.
             opt.visualization.plot_param_importances(study)
-            fig = opt.visualization.plot_param_importances(studyShallow)
+            fig = opt.visualization.plot_param_importances(study)
             fig.write_html("plot_param_importances_NN_Lightning.html")
+            pickleSave(f"NN_Lightning_Study_{dateTimeNow}.pkl",study)
+            bestDictLightning = study.best_trial.params
         else:
-            with open('BestTrialParams20210704-125835_Lightning.pkl','rb') as f:
+            with open('BestTrialParams20210726-211755_Lightning.pkl','rb') as f:
                 bestDictLightning = pickle.load(f)
             
             if overwriteNNDictProperty:
                 bestDictLightning[loopVarName] = loopVar
 
-            trainer = pl.Trainer(
-                gpus=1,max_epochs=epochs,stochastic_weight_avg=True, logger=tb_logger)
-            model1 = LitModel(t.Tensor(xTrT[:50]).float(),bestDictLightning=bestDictLightning)
-            if tuneModel:
-                lr_finder = trainer.tuner.lr_find(model1,trDl,evalDl)
-                fig = lr_finder.plot(suggest=True)
-                fig.savefig('LR_finder.png')
-                new_lr = lr_finder.suggestion()
-                # trainer.tune(model1,trDl)
-            else:
-                trainer.fit(model1, trDl, evalDl)
-                with t.no_grad():
-                    yEPredictedLit = predictAndInvTransform(
-                        t.Tensor(xET),model1, deepflag=True
-                    )
-                    litFinalEvalLoss = RMSLE(yEPredictedLit, yE)
+        trainer = pl.Trainer(
+            gpus=1,max_epochs=epochs,stochastic_weight_avg=True, logger=tb_logger)
+        model1 = LitModel(t.Tensor(xTrT[:50]).float(),bestDictLightning=bestDictLightning)
+        if tuneModel:
+            lr_finder = trainer.tuner.lr_find(model1,trDl,evalDl)
+            fig = lr_finder.plot(suggest=True)
+            fig.savefig('LR_finder.png')
+            new_lr = lr_finder.suggestion()
+            # trainer.tune(model1,trDl)
+        else:
+            trainer.fit(model1, trDl, evalDl)
+            with t.no_grad():
+                yEPredictedLit = predictAndInvTransform(
+                    t.Tensor(xET),model1, deepflag=True
+                )
+                litFinalEvalLoss = RMSLE(yEPredictedLit, yE)
 
-                    yTrPredictedLit = predictAndInvTransform(
-                        t.Tensor(xTrT),model1, deepflag=True
-                    )
-                    litFinalTrainLoss = RMSLE(yTrPredictedLit, yTr)
+                yTrPredictedLit = predictAndInvTransform(
+                    t.Tensor(xTrT),model1, deepflag=True
+                )
+                litFinalTrainLoss = RMSLE(yTrPredictedLit, yTr)
+                pred_evaluation = predictAndInvTransform(t.Tensor(evalData_transformed),model1,deepflag=True)
+                rmsleLoss_final_evaluation = RMSLE(pred_evaluation, evalTarget)
 
-                    print('\nLighting model final RMSLE Loss:')
-                    print(f"Train: {litFinalTrainLoss}, Eval: {litFinalEvalLoss}")
-                    yPredLit = predictAndInvTransform(
-                        t.Tensor(teDT),model1, deepflag=True)
-                    saveSubmission(yPredLit, 'DeepLit')
-                    modelsEvalScores["NNLightning_Eval"]=litFinalEvalLoss
-                    modelsEvalScores["NNLightning_Train"]=litFinalTrainLoss
+                print('\nLighting model final RMSLE Loss:')
+                print(f"Train: {litFinalTrainLoss}, Eval: {litFinalEvalLoss}, Final Evaluation: {rmsleLoss_final_evaluation}")
+                yPredLit = predictAndInvTransform(
+                    t.Tensor(teDT),model1, deepflag=True)
+                saveSubmission(yPredLit, 'DeepLit')
+                modelsEvalScores["NNLightning_Eval"]=litFinalEvalLoss
+                modelsEvalScores["NNLightning_Train"]=litFinalTrainLoss
     modelsEvalScores[loopVarName] = loopVar
     tempDf = pd.DataFrame(modelsEvalScores,index=[loopIdx])
     resultsDf=resultsDf.append(tempDf)                
