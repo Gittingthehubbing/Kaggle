@@ -481,7 +481,7 @@ def weightedSum(weights):
     return loss
 
 #Datadir
-mainDir = r"E:\KaggleData\Tabular Playground Series - Jul 2021"
+mainDir = r"D:\KaggleData\Tabular Playground Series - Jul 2021"
 
 """
 uses mean column-wise root mean squared logarithmic error
@@ -510,14 +510,15 @@ doLearningCurve = False
 logTB = False
 logTB_lightining = False
 
-doShallows =0
+doShallows =1
 shallowToDo = {
     "rfr":0,
     "SVR":0,
-    "xgboost":1,
+    "xgboost":0,
+    "xgboostF":1,
 }
 doPYNN = 0
-doLightning = 1
+doLightning = 0
 tuneModel = 0
 
 #Testing extra hyperparams
@@ -527,7 +528,7 @@ reg_alpha  = 1e-4
 
 optimizeWeightedSum = False
 doOptuna = 0 #applies to all methods above
-loadStudy = True
+loadStudy = False
 dateTimeOfStudy = "20210726-125126" #to continue previous Study
 
 #optuna Params
@@ -550,7 +551,7 @@ numBatchesForOptunaTr = 30
 numBatchesForOptunaTe = 20
 
 #optuna shallow params
-possibleShallows = ["xgboost"]#"rfr","SVR","gradB","xgboost"
+possibleShallows = ["xgboostF"]#"rfr","SVR","gradB","xgboost","xgboostF"
 numShallowSamples = 50000
 
 #Toggles for data augmentation overview
@@ -571,9 +572,11 @@ plotCorreclations = 0
 plotTargetsOverTime = 0
 printDataStats = 0
 
-with open(f'{mainDir}/BestTrialParams20210726-064703.pkl','rb') as f:
-            bestDictNN = pickle.load(f)
-    
+try:
+    with open(f'{mainDir}/BestTrialParams20210726-064703.pkl','rb') as f:
+                bestDictNN = pickle.load(f)
+except:
+    print("No dict found for NN")    
     
 os.chdir(mainDir)
 dateTimeNow =  datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -792,7 +795,34 @@ for loopIdx,loopVar in enumerate(forLoop):
             fig.write_html("plot_param_importances_Shallow.html")
             pickleSave(f"ShallowStudy_{dateTimeNow}.pkl",study)
         else:
-            
+            if shallowToDo["xgboostF"]:
+                if retrainModels:
+                    firstDict = {
+                        "n_estimators":10,
+                        "max_depth":5,
+                        "learning_rate":1.0,
+                        "booster":"gbtree", #gbtree, gblinear, dart
+                        "tree_method":"auto",
+                        "gamma":0.3,
+                        "min_child_weight":0.3,
+                        "max_delta_step":0.3,
+                        "subsample":0.3,
+                        "colsample_bynode":0.3,
+                        "reg_alpha":1e-5,
+                        "reg_lambda":1e-5,
+                        "scale_pos_weight":0.3,
+                        "base_score":0.3,
+                        "num_parallel_tree":10,
+                    }
+                    
+                    xgFor = MultiOutputRegressor(xgb.XGBRFRegressor(**firstDict) )
+                    xgFor, mseLoss, predSub, rmsleLoss, rmsleLossTrain = runShallow(xgFor)
+                    pred_evaluation = predictAndInvTransform(evalData_transformed,xgFor)
+                    rmsleLoss_final_evaluation = RMSLE(pred_evaluation, evalTarget)
+                    print('xgFor MSE: ',mseLoss)
+                    print('xgFor RMSLE: ', rmsleLoss, ' Train: ',rmsleLossTrain, " Final Eval: ",rmsleLoss_final_evaluation)
+                    if saveTrainedModels:
+                        pickleSave(f"{mainDir}/xgFor_{dateTimeNow}.pkl",xgFor)
             
             if shallowToDo["xgboost"]:
                 if retrainModels:
