@@ -29,7 +29,10 @@ from sklearn.ensemble import RandomForestRegressor as rfr
 from sklearn.linear_model import BayesianRidge as bayR
 from sklearn.experimental import enable_hist_gradient_boosting
 from sklearn.ensemble import HistGradientBoostingRegressor as gradB
+from sklearn.ensemble import StackingRegressor
+from sklearn.linear_model import RidgeCV
 from sklearn.multioutput import MultiOutputRegressor
+from sklearn.multioutput import RegressorChain
 import xgboost as xgb
 from sklearn.preprocessing import StandardScaler as ss
 from sklearn.preprocessing import PowerTransformer
@@ -265,6 +268,28 @@ def shallowObjective(trial):
         model = xgb.XGBRegressor(**paramDict)
         multiRegModel = MultiOutputRegressor(model)
         trainLoss, evalLoss = runShallowOpt(multiRegModel, modelname,idxSel)
+    elif modelname == "xgboostF":
+        paramDict = {
+            "learning_rate" : trial.suggest_float("learning_rate",1e-5,1e0,log=True),
+            #"max_depth" : trial.suggest_int("max_depth",1,20),
+            #"min_child_weight" : trial.suggest_float("min_child_weight",1e-3,0.95),
+            "reg_lambda":trial.suggest_float("reg_lambda",1e-7,1e0,log=True),
+            "reg_alpha":trial.suggest_float("reg_alpha",1e-7,1e0,log=True),
+            #"gamma":trial.suggest_float("gamma",1e-2,0.95,log=False),
+            #"max_delta_step":trial.suggest_float("max_delta_step",1e-2,0.95,log=False),
+            #"subsample":trial.suggest_float("subsample",1e-2,0.95,log=False),
+            #"colsample_bynode":trial.suggest_float("colsample_bynode",1e-2,0.95,log=False),
+            "scale_pos_weight":trial.suggest_float("scale_pos_weight",1e-2,0.95,log=False),
+            "base_score":trial.suggest_float("base_score",1e-2,0.95,log=False),
+            #"num_parallel_tree" : trial.suggest_int("num_parallel_tree",1,20),
+            'tree_method':'gpu_hist',
+            'predictor': 'gpu_predictor',
+            "booster": trial.suggest_categorical("booster",["gbtree", "gblinear", "dart"])
+            }
+        
+        multiRegModel = MultiOutputRegressor(xgb.XGBRFRegressor(**paramDict) )
+        trainLoss, evalLoss = runShallowOpt(multiRegModel, modelname,idxSel)
+
     overfitLoss = np.sqrt((evalLoss - trainLoss)**2)
     totalLoss = evalLoss + overfitLoss*0.1
     return totalLoss
@@ -480,8 +505,17 @@ def weightedSum(weights):
     loss = RMSLE(yTr,yTrPred) + RMSLE(yE,yEPred)
     return loss
 
+
+def addDayOfWeek(df):
+
+    dateTimeColTrain = pd.DatetimeIndex(pd.to_datetime(df[idCol]))
+    dayOfWeekCol = dateTimeColTrain.dayofweek
+    df["dayOfWeek"]=dayOfWeekCol
+    df=df.drop([idCol],axis=1)
+    return df
+
 #Datadir
-mainDir = r"D:\KaggleData\Tabular Playground Series - Jul 2021"
+mainDir = r"E:\KaggleData\Tabular Playground Series - Jul 2021"
 
 """
 uses mean column-wise root mean squared logarithmic error
@@ -491,7 +525,7 @@ uses mean column-wise root mean squared logarithmic error
 loopVarName = "_"
 overwriteNNDictProperty = False
 doLoop = False
-extraText = "Lightning_12_PastPoints_No_PCA"
+extraText = "Lightning_12_PastPoints_No_PCA_DayOfWeek"
 forLoop = np.logspace(-7,0,8)
 retrainModels = True
 saveTrainedModels =False
@@ -510,14 +544,16 @@ doLearningCurve = False
 logTB = False
 logTB_lightining = False
 
-doShallows =1
+doShallows =0
 shallowToDo = {
-    "rfr":0,
+    "rfr":1,
     "SVR":0,
     "xgboost":0,
-    "xgboostF":1,
+    "xgboostF":0,
 }
-doPYNN = 0
+stackShallows = 0
+chainShallows = 0
+doPYNN = 1
 doLightning = 0
 tuneModel = 0
 
@@ -527,7 +563,7 @@ reg_lambda = 1e-5 #reg_lambda for XGBoost
 reg_alpha  = 1e-4
 
 optimizeWeightedSum = False
-doOptuna = 0 #applies to all methods above
+doOptuna = 1 #applies to all methods above
 loadStudy = False
 dateTimeOfStudy = "20210726-125126" #to continue previous Study
 
@@ -551,7 +587,7 @@ numBatchesForOptunaTr = 30
 numBatchesForOptunaTe = 20
 
 #optuna shallow params
-possibleShallows = ["xgboostF"]#"rfr","SVR","gradB","xgboost","xgboostF"
+possibleShallows = ["rfr"]#"rfr","SVR","gradB","xgboost","xgboostF"
 numShallowSamples = 50000
 
 #Toggles for data augmentation overview
@@ -565,6 +601,8 @@ dupliFac = 0 #how many times the data should be appended
 #create extra features from previous data points
 pastPoints = 12 # this number -1 is number of new features per column
 redoPastDataAdding = True
+
+doAddDayOfWeek=True
 
 plotPCA = False
 checkHist = 0 #Target data looks like double normal distribution
@@ -588,34 +626,47 @@ if logTB_lightining and doLightning:
 else:
     tb_logger = None
 
-trainDataRaw = pd.read_csv("train.csv")
-testDataRaw = pd.read_csv("test.csv")
-
 targetCols = ["target_carbon_monoxide","target_benzene","target_nitrogen_oxides"]
 idCol = "date_time"
-trainingCols = list(trainDataRaw.columns)
-for col in targetCols.copy():
-    trainingCols.remove(col)
-trainingCols.remove(idCol)
 
-evalIdx = int(len(trainDataRaw)*evaluationSplit)
-evaluationData = trainDataRaw.iloc[evalIdx:]
-evalData = evaluationData.drop([*targetCols,idCol],axis=1).copy()
-evalTarget = evaluationData[targetCols].copy()
 
-trD = trainDataRaw.iloc[:evalIdx].drop([*targetCols,idCol],axis=1).copy()
-teD = testDataRaw.copy().drop([idCol],axis=1)
-trTarget = trainDataRaw.iloc[:evalIdx][targetCols].copy()
 
 
 resultDicts=[]
 resultsDf = pd.DataFrame()
 for loopIdx,loopVar in enumerate(forLoop):
+        
+    trainDataRaw = pd.read_csv("train.csv")
+    testDataRaw = pd.read_csv("test.csv")
+
+    trainingCols = list(trainDataRaw.columns)
+    for col in targetCols.copy():
+        trainingCols.remove(col)
+
+
+
+    evalIdx = int(len(trainDataRaw)*evaluationSplit)
+    evaluationData = trainDataRaw.iloc[evalIdx:]
+    evalData = evaluationData.drop([*targetCols],axis=1).copy()
+    evalTarget = evaluationData[targetCols].copy()
+
+    trD = trainDataRaw.iloc[:evalIdx].drop([*targetCols],axis=1).copy()
+    teD = testDataRaw.copy()
+    trTarget = trainDataRaw.iloc[:evalIdx][targetCols].copy()
 
     if doLoop:
         print(f"Changing {loopVarName} to {loopVar}")
         globals()[loopVarName] = loopVar        
 
+
+    if doAddDayOfWeek:
+        trD = addDayOfWeek(trD)
+        teD = addDayOfWeek(teD)
+        evalData = addDayOfWeek(evalData)
+    else:
+        trD=trD.drop([idCol],axis=1)
+        teD=teD.drop([idCol],axis=1)
+        evalData=evalData.drop([idCol],axis=1)
 
     if logRedistr:
         trTargetBefore = np.round(trTarget.copy(),10)
@@ -632,6 +683,7 @@ for loopIdx,loopVar in enumerate(forLoop):
 
 
     allCols = list(trD.keys())
+    if "dayOfWeek" in allCols: allCols.remove("dayOfWeek")
     if redoPastDataAdding:
         print('Redoing past points with ',pastPoints,' points')
         trD = addPastDataFeatures(trD, pastPoints, allCols)
@@ -651,7 +703,8 @@ for loopIdx,loopVar in enumerate(forLoop):
         with open('evalDataAug.pkl','rb') as f:
             evalData=pickle.load(f) 
 
-    #trD.to_html('trD.html')
+
+    trD.to_html('trD.html')
             
 
     if doPCA:
@@ -792,30 +845,51 @@ for loopIdx,loopVar in enumerate(forLoop):
             print(shallowTrial)
             saveBestTrial(studyShallow,'Shallow')        
             fig = opt.visualization.plot_param_importances(studyShallow)
-            fig.write_html("plot_param_importances_Shallow.html")
-            pickleSave(f"ShallowStudy_{dateTimeNow}.pkl",study)
+            fig.write_html(f"ShallowStudy_{dateTimeOfStudy}_plot_param_importances_Shallow.html")
+            pickleSave(f"ShallowStudy_{dateTimeNow}.pkl",studyShallow)
         else:
+            if retrainModels:
+
+                xgboostFDict = pickleLoad("BestTrialParams20210731-110633_Shallow.pkl")                
+                if "modelname" in xgboostFDict.keys():
+                    del xgboostFDict["modelname"]
+                xgForSingle = xgb.XGBRFRegressor(**xgboostFDict) 
+                xgFor = MultiOutputRegressor(xgForSingle)
+
+                paramDictXGBoost=pickleLoad("BestTrialParams20210710-190103_Shallow.pkl")
+                paramDictXGBoost ['tree_method']='gpu_hist'
+                paramDictXGBoost ['predictor']='gpu_predictor' 
+                paramDictXGBoost ['reg_lambda']=reg_lambda 
+                paramDictXGBoost ['reg_alpha']=reg_alpha 
+                if "lambdaVal" in paramDictXGBoost.keys():
+                    paramDictXGBoost["lambda"] = paramDictXGBoost["lambdaVal"]
+                    del paramDictXGBoost["lambdaVal"]
+                if "modelname" in paramDictXGBoost.keys():
+                    del paramDictXGBoost["modelname"]
+                RegXGSingle = xgb.XGBRegressor(**paramDictXGBoost)
+                multiRegXG = MultiOutputRegressor(RegXGSingle)
+                multiRegXGParams = multiRegXG.get_params()
+                
+                bestForestDict=pickleLoad("BestTrialParams20210711-085005_Shallow.pkl")
+                bestForestDict["ccp_alpha"] = ccp_alpha_RFR
+                del bestForestDict["modelname"]                
+                RegForestrSingle = rfr(**bestForestDict)
+                multiRegForest = MultiOutputRegressor(RegForestrSingle)
+            
+                bestSVR = {
+                    'modelname': 'SVR',
+                    'C': 35.542238529147916,
+                    'kernel': 'poly',
+                    'degree': 2,
+                    'gamma': 'scale',
+                    'coef0': 0.1829941183576717}
+                del bestSVR["modelname"]
+                svrSingle = SVR(**bestSVR)
+                svrMulti = MultiOutputRegressor(svrSingle)
+
             if shallowToDo["xgboostF"]:
                 if retrainModels:
-                    firstDict = {
-                        "n_estimators":10,
-                        "max_depth":5,
-                        "learning_rate":1.0,
-                        "booster":"gbtree", #gbtree, gblinear, dart
-                        "tree_method":"auto",
-                        "gamma":0.3,
-                        "min_child_weight":0.3,
-                        "max_delta_step":0.3,
-                        "subsample":0.3,
-                        "colsample_bynode":0.3,
-                        "reg_alpha":1e-5,
-                        "reg_lambda":1e-5,
-                        "scale_pos_weight":0.3,
-                        "base_score":0.3,
-                        "num_parallel_tree":10,
-                    }
                     
-                    xgFor = MultiOutputRegressor(xgb.XGBRFRegressor(**firstDict) )
                     xgFor, mseLoss, predSub, rmsleLoss, rmsleLossTrain = runShallow(xgFor)
                     pred_evaluation = predictAndInvTransform(evalData_transformed,xgFor)
                     rmsleLoss_final_evaluation = RMSLE(pred_evaluation, evalTarget)
@@ -826,22 +900,7 @@ for loopIdx,loopVar in enumerate(forLoop):
             
             if shallowToDo["xgboost"]:
                 if retrainModels:
-                    with open(rf'{mainDir}/BestTrialParams20210710-190103_Shallow.pkl','rb') as f:
-                        paramDictXGBoost=pickle.load(f)
-                    paramDictXGBoost ['tree_method']='gpu_hist'
-                    paramDictXGBoost ['predictor']='gpu_predictor' 
-                    paramDictXGBoost ['reg_lambda']=reg_lambda 
-                    paramDictXGBoost ['reg_alpha']=reg_alpha 
-                    if "lambdaVal" in paramDictXGBoost.keys():
-                        paramDictXGBoost["lambda"] = paramDictXGBoost["lambdaVal"]
-                        del paramDictXGBoost["lambdaVal"]
-                    if "modelname" in paramDictXGBoost.keys():
-                        del paramDictXGBoost["modelname"]
-                    #BestTrialParams20210704-145220_Shallow.pkl
-                    multiRegXG = MultiOutputRegressor(xgb.XGBRegressor(**paramDictXGBoost))
-                    multiRegXGParams = multiRegXG.get_params()
-                    #print("multiRegXGParams ",multiRegXGParams)
-
+                    
                     print('\nFitting XGBoost now')
                     multiRegXG, mseLoss, predSub, rmsleLoss, rmsleLossTrain = runShallow(multiRegXG)
                     pred_evaluation = predictAndInvTransform(evalData_transformed,multiRegXG)
@@ -865,15 +924,6 @@ for loopIdx,loopVar in enumerate(forLoop):
             if shallowToDo["SVR"]:
                 if retrainModels:    
 
-                    bestSVR = {
-                        'modelname': 'SVR',
-                        'C': 35.542238529147916,
-                        'kernel': 'poly',
-                        'degree': 2,
-                        'gamma': 'scale',
-                        'coef0': 0.1829941183576717}
-                    del bestSVR["modelname"]
-                    svrMulti = MultiOutputRegressor(SVR(**bestSVR))
                     ranSVR, mseLoss, predSub, rmsleLoss, rmsleLossTrain = runShallow(svrMulti)
                     pred_evaluation = predictAndInvTransform(evalData_transformed,ranSVR)
                     rmsleLoss_final_evaluation = RMSLE(pred_evaluation, evalTarget)
@@ -893,14 +943,6 @@ for loopIdx,loopVar in enumerate(forLoop):
 
             if shallowToDo["rfr"]:
                 if retrainModels:
-                        
-                    with open(rf'{mainDir}/BestTrialParams20210711-085005_Shallow.pkl','rb') as f:
-                        bestForestDict=pickle.load(f)
-                    bestForestDict["ccp_alpha"] = ccp_alpha_RFR
-                    del bestForestDict["modelname"]
-                    multiRegForest = MultiOutputRegressor(
-                        rfr(**bestForestDict))
-
                     ranForest, mseLoss, predSub, rmsleLoss, rmsleLossTrain = runShallow(multiRegForest)
                     pred_evaluation = predictAndInvTransform(evalData_transformed,ranForest)
                     rmsleLoss_final_evaluation = RMSLE(pred_evaluation, evalTarget)
@@ -944,6 +986,37 @@ for loopIdx,loopVar in enumerate(forLoop):
                     pickleSave(f"{mainDir}/weightsSumming_{dateTimeNow}.pkl",results)
                 weightedSubmission = saveSubmission(weightedSumOfPreds, 'weightedSumOfPreds', True)
                 modelsEvalScores["weightedAvg"]=results
+
+            if stackShallows:
+
+                estimators = [
+                    ("xgForSingle",xgForSingle),("RegXGSingle",RegXGSingle),
+                    ("RegForestrSingle",RegForestrSingle),("svrSingle",svrSingle)
+                    ]
+                stackReg = MultiOutputRegressor(StackingRegressor(estimators=estimators,final_estimator=final_estimator,verbose=1))
+                stackReg, mseLoss, predSub, rmsleLoss, rmsleLossTrain = runShallow(stackReg,True)
+                pred_evaluation = predictAndInvTransform(evalData_transformed,stackReg)
+                rmsleLoss_final_evaluation = RMSLE(pred_evaluation, evalTarget)
+                predSub = predictAndInvTransform(teDT,stackReg)
+                stackedPrediction = saveSubmission(predSub, 'Shallow_Stack', True)              
+                print('stackReg MSE: ',mseLoss)
+                print('stackReg RMSLE: ', rmsleLoss, ' Train: ',rmsleLossTrain, " Final Eval: ",rmsleLoss_final_evaluation)
+            
+            if chainShallows:
+    
+                estimators = [
+                    ("xgForSingle",xgForSingle),("RegXGSingle",RegXGSingle),
+                    ("RegForestrSingle",RegForestrSingle),("svrSingle",svrSingle)
+                    ]
+                final_estimator = RidgeCV()
+                chainReg = RegressorChain(StackingRegressor(estimators=estimators,final_estimator=final_estimator,verbose=1))
+                chainReg, mseLoss, predSub, rmsleLoss, rmsleLossTrain = runShallow(chainReg,True)
+                pred_evaluation = predictAndInvTransform(evalData_transformed,chainReg)
+                rmsleLoss_final_evaluation = RMSLE(pred_evaluation, evalTarget)
+                predSub = predictAndInvTransform(teDT,chainReg)
+                stackedPrediction = saveSubmission(predSub, 'Shallow_Stack', True)              
+                print('chainReg MSE: ',mseLoss)
+                print('chainReg RMSLE: ', rmsleLoss, ' Train: ',rmsleLossTrain, " Final Eval: ",rmsleLoss_final_evaluation)
 
 
 
